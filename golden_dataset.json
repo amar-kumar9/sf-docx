@@ -1,0 +1,53 @@
+[
+  {
+    "user_input": "What is the latest Salesforce API version?",
+    "reference": "The current Salesforce API version is Winter '27 (API version 68.0).",
+    "reference_contexts": [
+      "Salesforce API version 68.0 corresponds to the Winter '27 release."
+    ],
+    "type": "current_fact"
+  },
+  {
+    "user_input": "What is the Salesforce Apex heap size?",
+    "reference": "Apex heap size limits are 6 MB for synchronous Apex and 12 MB for asynchronous Apex.",
+    "reference_contexts": [
+      "The Apex heap size limit is 6 MB for synchronous Apex and 12 MB for asynchronous Apex."
+    ],
+    "type": "current_fact"
+  },
+  {
+    "user_input": "What is Agentforce Coworker?",
+    "reference": "Agentforce Coworker is an AI-powered agent that connects work tools into one conversational interface and is powered by Data 360.",
+    "reference_contexts": [
+      "Agentforce Coworker (Beta) is your AI-powered agent, connecting all your work tools into one conversational interface.",
+      "Powered by Data 360, Agentforce Coworker connects all your work tools into one conversational interface."
+    ],
+    "type": "explanation"
+  },
+  {
+    "user_input": "I would like to classify the cases based on the subject, description and other classification fields on the case object.",
+    "reference": "Einstein Case Classification can recommend a classification value using case data such as Subject, Description, and custom classification fields, and it can route the case to the right agent or queue.",
+    "reference_contexts": [
+      "CaseClassification enables Einstein Case Classification.",
+      "Case Classification offers recommendations to your agents so they can select the best value.",
+      "You can automatically save the best recommendation and route the case to the right agent."
+    ],
+    "type": "design"
+  },
+  {
+    "user_input": "What is a Platform Event?",
+    "reference": "A Platform Event is an event-driven mechanism in Salesforce for publishing and subscribing to business events.",
+    "reference_contexts": [
+      "Platform Events are part of Salesforce's event-driven architecture and let you publish and subscribe to business events."
+    ],
+    "type": "explanation"
+  },
+  {
+    "user_input": "What was the Salesforce API version in the Winter '20 release notes?",
+    "reference": "The Winter '20 era documentation referenced API version 47.0 in the connector release notes.",
+    "reference_contexts": [
+      "MuleSoft Salesforce Connector release notes listed Salesforce API versions up to v47.0."
+    ],
+    "type": "historical_release"
+  }
+]
