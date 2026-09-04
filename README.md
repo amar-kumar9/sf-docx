@@ -1,16 +1,24 @@
-# Salesforce QA Agent
+# Salesforce Docs Agent
 
-Local Salesforce documentation Q&A agent with retrieval, synthesis, grounding, and eval support.
+A local AI agent that answers questions about Salesforce by retrieving and grounding answers against real Salesforce documentation — not model training data.
+
+Every answer is verified against the source. If a claim isn't in the retrieved doc, the agent says so. For questions about things that change between releases — governor limits, heap sizes, API versions — the agent flags the answer as potentially stale and links directly to the relevant Salesforce release notes.
+
+## What it does
+
+- Retrieves relevant Salesforce documentation chunks via MCP
+- Synthesizes answers grounded in the retrieved content
+- Detects temporally volatile questions (limits, versioned features) and forces a release notes check
+- Runs a regression eval harness against a golden dataset
 
 ## Layout
 
-- `app.py` - runtime app and retrieval pipeline
-- `prompts.py` - prompt templates and routing instructions
-- `data/` - labeled datasets and sample inputs
-- `eval/` - benchmark harness and MCP fixtures
-- `scripts/` - local diagnostic helpers
-- `tests/` - focused pipeline tests
-- `artifacts/` - generated eval outputs and reports
+- `app.py` - retrieval pipeline, grounding, temporal validation, answer synthesis
+- `prompts.py` - prompt templates
+- `data/` - golden dataset and sample inputs
+- `eval/` - eval harness and MCP fixtures
+- `scripts/` - local retrieval diagnostics
+- `tests/` - pipeline tests
 
 ## Run
 

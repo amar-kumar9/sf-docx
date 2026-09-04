@@ -8,8 +8,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from loguru import logger
-import gradio as gr
-
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
@@ -806,10 +804,6 @@ def build_search_queries(message: str, intent_data: dict, llm, temporal_context:
         for booster in reversed(boosters):
             if booster not in result:
                 result.insert(0, booster)
-        if temporal["temporal_validation_required"] and not temporal["historical_release_requested"]:
-            current_query = f"{message} current Salesforce documentation"
-            if current_query not in result:
-                result.insert(0, current_query)
         result = result[:max_q]
         logger.info(f"Planned queries: {result}")
         return result
@@ -833,13 +827,10 @@ def build_search_queries(message: str, intent_data: dict, llm, temporal_context:
             for booster in reversed(definition_boosters):
                 if booster not in result:
                     result.insert(0, booster)
-            for booster in reversed(boosters):
-                if booster not in result:
-                    result.insert(0, booster)
-            if temporal["temporal_validation_required"] and not temporal["historical_release_requested"]:
-                current_query = f"{message} current Salesforce documentation"
-                if current_query not in result:
-                    result.insert(0, current_query)
+            if len(result) < max_q:
+                for booster in boosters:
+                    if booster not in result:
+                        result.append(booster)
             if definition_intent:
                 core = _extract_core_concept(message)
                 for query in _definition_query_variants(core, intent_data):
@@ -1881,63 +1872,7 @@ def run_agent(message: str, history: list) -> str:
 
     return f"[{provider_label}] {answer}"
 
-# ---------------------------------------------------------------------------
-# Gradio UI
-# ---------------------------------------------------------------------------
-
-def set_groq_key(key: str):
-    if key and isinstance(key, str) and key.strip():
-        os.environ["GROQ_API_KEY"] = key.strip()
-        return "✅ Groq key saved."
-    return "⚠️ No key provided."
-
-
-with gr.Blocks(fill_height=True) as demo:
-    with gr.Sidebar():
-        gr.Markdown("## ☁️ SFDC Architect Agent")
-        gr.Markdown(
-            "Salesforce Technical Architect AI — grounded in live "
-            "Salesforce documentation via MCP."
-        )
-        gr.HTML("<hr>")
-        gr.Markdown("### ⚙️ Providers")
-        groq_input = gr.Textbox(
-            label="Groq API Key",
-            type="password",
-            placeholder="gsk_...",
-        )
-        gr.Markdown("_Ollama is used as fallback._")
-        status_label = gr.Label(value="Status: Ready.")
-        groq_input.change(fn=set_groq_key, inputs=[groq_input], outputs=[status_label])
-        gr.HTML("<hr>")
-        gr.Markdown(
-            "**Pipeline per turn:**\n"
-            "1. Classify intent + entities\n"
-            "2. Validate temporal scope\n"
-            "3. Plan search queries\n"
-            "4. Retrieve evidence (bounded)\n"
-            "5. Normalize evidence\n"
-            "6. Resolve evidence conflicts\n"
-            "7. Generate answer (tier-routed)\n"
-            "8. Grounding check\n\n"
-            "**Model tiers:**\n"
-            "- Fast — facts, definitions\n"
-            "- Standard — comparisons, research\n"
-            "- Reasoning — architecture, complex code"
-        )
-
-    gr.ChatInterface(
-        fn=run_agent,
-        fill_height=True,
-        examples=[
-            "Agentforce Coworker Benefits and Use Cases",
-            "What is the latest Salesforce API version?",
-            "What is a Platform Event?",
-            "Can Flow replace an Apex trigger?",
-            "We process 500,000 records every night. What Salesforce architecture should we use?",
-            "Why am I getting Too many SOQL queries?",
-        ],
-    )
-
 if __name__ == "__main__":
-    demo.launch(theme=gr.themes.Soft())
+    import sys
+    question = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else "What is a Platform Event?"
+    print(run_agent(question, []))
