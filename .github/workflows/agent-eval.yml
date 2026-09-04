@@ -1,0 +1,46 @@
+name: Agent Eval
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  agent-eval:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run agent eval
+        shell: pwsh
+        run: |
+          python agent_eval.py `
+            --dataset golden_dataset.json `
+            --output agent_eval_ci.csv `
+            --summary agent_eval_ci.summary.json `
+            --google-mode none `
+            --fail-on-regression `
+            --max-pass-drop 0.00 `
+            --max-rubric-drop 0.00
+
+      - name: Upload eval artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-eval-results
+          path: |
+            agent_eval_ci.csv
+            agent_eval_ci.summary.json

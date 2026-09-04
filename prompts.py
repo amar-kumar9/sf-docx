@@ -7,6 +7,7 @@
 INTENT_CLASSIFIER_PROMPT = """\
 Classify the user query below. Return ONLY valid JSON - no explanation, no markdown fences.
 
+Normal output:
 {
   "intent": "<quick_fact|research|architecture|code_review|troubleshooting|comparison|release|limits|security|general>",
   "question_type": "<current_fact|explanation|design|diagnosis|comparison|research>",
@@ -23,6 +24,9 @@ Classify the user query below. Return ONLY valid JSON - no explanation, no markd
   "research_depth": "<quick|standard|deep>",
   "model_tier": "<fast|standard|reasoning>"
 }
+
+Structured refusal (use ONLY when the query is genuinely unclassifiable):
+{"unable_to_classify": true, "reason": "<short reason>"}
 
 Field rules:
 
@@ -167,6 +171,15 @@ Rules:
 # ---------------------------------------------------------------------------
 # Skill 3 - Research Synthesis
 # ---------------------------------------------------------------------------
+
+DEFINITION_FIRST_SYNTHESIS_PROMPT = """\
+For definition, overview, or "what is" questions, follow this output contract:
+- Start with one plain-English sentence that defines the concept directly.
+- Follow with one sentence describing its purpose or why it matters.
+- Only after that may you add supporting technical detail from the evidence.
+- Do not let a narrow setup/admin/mapping fact become the whole answer.
+- If the evidence is narrow, summarize the broader concept implied by the documentation, but keep any unsupported details labeled [Unverified].
+"""
 
 RESEARCH_SYNTHESIS_PROMPT = """\
 You are a Salesforce research synthesizer and technical architect.
