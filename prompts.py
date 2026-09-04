@@ -248,11 +248,31 @@ TROUBLESHOOTING / CODE_REVIEW:
   ## Governor Limit Impact (if relevant)
   ## Sources
 
+SOQL 101 / BULKIFICATION (trigger, Apex, or governor-limit questions):
+  - State the diagnosis plainly: the error is usually caused by SOQL inside a loop or repeated queries per record.
+  - Recommend the standard fix: bulkify the logic.
+  - Explain the implementation pattern: collect record Ids into a Set, query once with IN, and use a Map for lookups.
+  - Mention related guardrails when relevant: avoid DML in loops, prefer relationship queries or SOQL for loops, and keep trigger logic bulk-safe.
+  - If the user asks for code, include a short before/after example.
+  - Keep the answer practical and direct; do not over-explain governor limits.
+
 GENERAL (no Salesforce retrieval):
   Respond conversationally. Describe what the agent can help with.
 
 Only include sections supported by the evidence or the user's question.
 Never add a "Governor Limit Impact" section to a simple documentation question.
+"""
+
+CURRENT_FACT_DIRECT_ANSWER_PROMPT = """\
+You are answering a Salesforce fact question that has already passed the
+authoritative-source gate.
+
+Rules:
+- State the verified fact directly.
+- Do not prepend [Unverified] unless the evidence is actually missing or non-authoritative.
+- Do not re-litigate whether the fact is authoritative; the pipeline already checked that.
+- You may paraphrase the evidence as long as the meaning stays faithful to the source.
+- Keep the answer concise and factual.
 """
 
 # ---------------------------------------------------------------------------
@@ -320,7 +340,7 @@ For each significant finding:
   Severity: Critical | High | Medium | Low | Recommendation
   Impact: <consequence>
   Evidence: <documented fact or [Inference]>
-  Recommendation: <action>
+    Recommendation: <action>
 """
 
 # ---------------------------------------------------------------------------
@@ -361,6 +381,21 @@ For each finding:
 Do not rewrite working code unless the user explicitly requests a rewrite.
 """
 
+SOQL_101_HINT_PROMPT = """\
+For Apex/SOQL questions about "SOQL 101", "Too many SOQL queries", bulkification,
+or repeated queries in loops:
+
+- State the diagnosis plainly: the error is usually caused by SOQL inside a loop
+  or running one query per record.
+- Recommend the standard fix: bulkify the code.
+- Explain the implementation pattern: collect Ids into a Set, query once with IN,
+  and use a Map for lookups.
+- Mention related guardrails when relevant: avoid DML in loops, prefer
+  relationship queries or SOQL for loops, and keep trigger logic bulk-safe.
+- If the user asks for code, include a short before/after example.
+- Keep the answer practical and direct.
+"""
+
 # ---------------------------------------------------------------------------
 # Skill 6 - Grounding Check
 # ---------------------------------------------------------------------------
@@ -387,6 +422,10 @@ Rules:
   release information, product capabilities).
 - Do not flag general architectural reasoning or [Inference] labels.
 - Do not flag claims the user themselves stated in their question.
+- Treat a claim as supported when the evidence clearly states it or entails it by
+  paraphrase; do not require verbatim wording.
+- Flag a claim when it adds a new number, scope, capability, release, or action
+  that is not present in or clearly implied by the evidence.
 - Keep the check lightweight - focus on material factual claims, not style.
 """
 

@@ -1,12 +1,16 @@
 # Salesforce QA Agent
 
-This repo contains a local Salesforce documentation Q&A agent with:
+Local Salesforce documentation Q&A agent with retrieval, synthesis, grounding, and eval support.
 
-- `app.py` - the main Gradio app and retrieval pipeline
+## Layout
+
+- `app.py` - runtime app and retrieval pipeline
 - `prompts.py` - prompt templates and routing instructions
-- `agent_eval.py` - session-level eval harness and regression gate
-- `golden_dataset.json` - labeled evaluation cases
+- `data/` - labeled datasets and sample inputs
+- `eval/` - benchmark harness and MCP fixtures
+- `scripts/` - local diagnostic helpers
 - `tests/` - focused pipeline tests
+- `artifacts/` - generated eval outputs and reports
 
 ## Run
 
@@ -17,11 +21,17 @@ python app.py
 ## Evaluate
 
 ```powershell
-python agent_eval.py --compare --baseline-google-mode none --candidate-google-mode hybrid
+python eval/agent_eval.py --compare --baseline-google-mode none --candidate-google-mode hybrid
+```
+
+## Diagnose retrieval
+
+```powershell
+python scripts/diagnose_retrieval.py
 ```
 
 ## Notes
 
-- Keep `golden_dataset.json` versioned.
-- Generated logs, caches, and eval artifacts are ignored by git.
-- The repo is intentionally flat so the main entry points are easy to find.
+- Keep `data/golden_dataset.json` versioned.
+- Keep `eval/eval_mcp_fixtures.json` versioned.
+- Generated logs and eval outputs belong under `artifacts/` or `logs/`.

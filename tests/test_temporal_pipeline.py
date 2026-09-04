@@ -68,7 +68,7 @@ def test_current_governor_limit_temporal_context_and_queries():
 
     intent = app.classify_intent("What is the Apex heap size?", llm)
     temporal = app.validate_temporal_context("What is the Apex heap size?", intent, llm)
-    queries = app.build_search_queries("What is the Apex heap size?", intent, llm)
+    queries = app.build_search_queries("What is the Apex heap size?", intent, llm, temporal)
 
     assert intent["requires_current_docs"] is True
     assert temporal["temporal_validation_required"] is True
@@ -112,7 +112,7 @@ def test_historical_release_keeps_release_scope():
 
     intent = app.classify_intent("What was the Apex heap size in Winter '26?", llm)
     temporal = app.validate_temporal_context("What was the Apex heap size in Winter '26?", intent, llm)
-    queries = app.build_search_queries("What was the Apex heap size in Winter '26?", intent, llm)
+    queries = app.build_search_queries("What was the Apex heap size in Winter '26?", intent, llm, temporal)
 
     assert temporal["historical_release_requested"] is True
     assert temporal["requested_release"] == "Winter '26"
@@ -123,6 +123,48 @@ def test_historical_release_keeps_release_scope():
 def test_architecture_prompt_explicitly_prefers_bullets_over_tables():
     assert "Prefer bullets for single recommendations" in prompts.RESEARCH_SYNTHESIS_PROMPT
     assert "Never merge headers into one cell" in prompts.RESEARCH_SYNTHESIS_PROMPT
+
+
+def test_soql_101_questions_get_bulkification_hint():
+    intent = {
+        "intent": "troubleshooting",
+        "question_type": "diagnosis",
+        "requires_code_analysis": True,
+        "requires_documentation": True,
+        "research_depth": "standard",
+    }
+    prompt = app.build_synthesis_prompt("what is best way to avoide soql 101 error", intent)
+
+    assert "SOQL 101 / BULKIFICATION" in prompt or "SOQL/SOQL" in prompt
+    assert "collect record Ids into a Set" in prompt or "collect Ids into a Set" in prompt
+
+
+def test_definition_sufficiency_stage_requires_an_overview_page():
+    intent = {
+        "intent": "research",
+        "question_type": "explanation",
+        "requires_documentation": True,
+    }
+    evidence = [
+        {
+            "title": "Agentforce Coworker Review User Mapping",
+            "excerpt": "Identity Resolution ruleset and user mapping.",
+            "source_type": "Salesforce Documentation",
+            "authority": "Salesforce Documentation",
+            "is_authoritative": True,
+            "document_path": "/docs/data/agentforce-coworker-review-user-mapping",
+        }
+    ]
+    result = app._evidence_sufficiency_stage(
+        evidence,
+        intent,
+        "What is Agentforce Coworker?",
+        {"agentforce", "coworker"},
+        require_authoritative=True,
+    )
+
+    assert result["sufficient"] is False
+    assert result["reason"] == "definition_not_satisfied"
 
 
 def test_fallback_content_detection_distinguishes_provider_failure():
@@ -246,6 +288,56 @@ def test_current_fact_retrieval_keeps_searching_until_authoritative_source():
         assert len(evidence) == 2
         assert any("MuleSoft" in item["title"] for item in evidence)
         assert any("Salesforce Developer Documentation" in item["title"] for item in evidence)
+    finally:
+        app.build_search_queries = original_build_search_queries
+        app.mcp_search = original_mcp_search
+        app.mcp_fetch = original_mcp_fetch
+
+
+def test_retrieve_evidence_does_not_add_duplicate_temporal_queries():
+    intent = {
+        "intent": "release",
+        "question_type": "current_fact",
+        "requires_documentation": True,
+        "research_depth": "quick",
+    }
+    temporal = {
+        "temporal_validation_required": True,
+        "current_docs_required": True,
+        "historical_release_requested": False,
+        "requested_release": None,
+    }
+    seen = {"queries": []}
+    original_build_search_queries = app.build_search_queries
+    original_mcp_search = app.mcp_search
+    original_mcp_fetch = app.mcp_fetch
+
+    try:
+        app.build_search_queries = lambda message, intent_data, llm: [
+            "What is the latest Salesforce API version? current Salesforce documentation release notes",
+            "Salesforce API version latest release",
+        ]
+
+        def fake_search(query):
+            seen["queries"].append(query)
+            return {
+                "title": "Salesforce Developer Documentation",
+                "excerpt": "Current API version docs excerpt.",
+                "source_type": "Salesforce Documentation",
+                "authority": "Salesforce Documentation",
+                "is_authoritative": True,
+                "document_path": "/docs/current-api-version",
+            }
+
+        app.mcp_search = fake_search
+        app.mcp_fetch = lambda path: {}
+
+        app.retrieve_evidence("What is the latest Salesforce API version?", intent, object(), temporal)
+
+        assert seen["queries"] == [
+            "What is the latest Salesforce API version? current Salesforce documentation release notes",
+            "Salesforce API version latest release",
+        ]
     finally:
         app.build_search_queries = original_build_search_queries
         app.mcp_search = original_mcp_search
@@ -506,7 +598,7 @@ def test_agentforce_requires_documentation_and_temporal_planning():
 
     intent = app.classify_intent("Agentforce Coworker Benefits and Use Cases", llm)
     temporal = app.validate_temporal_context("Agentforce Coworker Benefits and Use Cases", intent, llm)
-    queries = app.build_search_queries("Agentforce Coworker Benefits and Use Cases", intent, llm)
+    queries = app.build_search_queries("Agentforce Coworker Benefits and Use Cases", intent, llm, temporal)
 
     assert intent["is_salesforce_specific"] is True
     assert intent["requires_documentation"] is True
@@ -575,6 +667,7 @@ def test_architecture_case_routes_multiple_queries_and_conflict_resolution():
         "We process 5 million records per day. What Salesforce integration architecture should we use?",
         intent,
         llm,
+        temporal,
     )
     conflict = app.resolve_evidence_conflicts(
         [

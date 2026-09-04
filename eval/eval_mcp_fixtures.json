@@ -1,0 +1,187 @@
+[
+  {
+    "name": "agentforce_coworker_overview",
+    "match": [
+      "what is agentforce coworker",
+      "agentforce coworker"
+    ],
+    "search": {
+      "title": "Agentforce Coworker (Beta)",
+      "excerpt": "Agentforce Coworker (Beta) is an AI-powered agent that connects your work tools into one conversational interface. It is powered by Data 360.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/data/agentforce-coworker/guide/agentforce-coworker-a-home.html",
+      "url": "https://developer.salesforce.com/docs/data/agentforce-coworker/guide/agentforce-coworker-a-home.html"
+    },
+    "fetch": {
+      "title": "Agentforce Coworker (Beta)",
+      "excerpt": "Agentforce Coworker (Beta) is an AI-powered agent that connects all of your work tools into a single conversational interface. It is powered by Data 360 and is designed to help users find information faster across connected tools.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/data/agentforce-coworker/guide/agentforce-coworker-a-home.html",
+      "url": "https://developer.salesforce.com/docs/data/agentforce-coworker/guide/agentforce-coworker-a-home.html"
+    }
+  },
+  {
+    "name": "agentforce_coworker_user_mapping",
+    "match": [
+      "review user mapping",
+      "identity resolution ruleset",
+      "user mapping"
+    ],
+    "search": {
+      "title": "Agentforce Coworker Review User Mapping",
+      "excerpt": "When you turn on Agentforce Coworker, Salesforce automatically creates an Identity Resolution ruleset. This ruleset maps user identities across connected data sources such as Salesforce CRM, Slack, and Google Drive.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/data/agentforce-coworker/guide/agentforce-coworker-review-user-mapping.html",
+      "url": "https://developer.salesforce.com/docs/data/agentforce-coworker/guide/agentforce-coworker-review-user-mapping.html"
+    },
+    "fetch": {
+      "title": "Agentforce Coworker Review User Mapping",
+      "excerpt": "When you turn on Agentforce Coworker, Salesforce automatically creates an Identity Resolution ruleset. This ruleset maps user identities across connected data sources such as Salesforce CRM, Slack, and Google Drive.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/data/agentforce-coworker/guide/agentforce-coworker-review-user-mapping.html",
+      "url": "https://developer.salesforce.com/docs/data/agentforce-coworker/guide/agentforce-coworker-review-user-mapping.html"
+    }
+  },
+  {
+    "name": "case_classification_overview",
+    "match": [
+      "classify the cases based on the subject",
+      "classification fields on the case object",
+      "case classification",
+      "einstein case classification"
+    ],
+    "search": {
+      "title": "CaseClassification",
+      "excerpt": "CaseClassification enables Einstein Case Classification. Case Classification offers recommendations to your agents so they can select the best value. You can automatically save the best recommendation and route the case to the right agent.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/service/case-classification/guide/caseclassification.html",
+      "url": "https://developer.salesforce.com/docs/service/case-classification/guide/caseclassification.html"
+    },
+    "fetch": {
+      "title": "CaseClassification",
+      "excerpt": "CaseClassification enables Einstein Case Classification. It offers recommendations to your agents so they can select the best value and can automatically save the best recommendation and route the case to the right agent.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/service/case-classification/guide/caseclassification.html",
+      "url": "https://developer.salesforce.com/docs/service/case-classification/guide/caseclassification.html"
+    }
+  },
+  {
+    "name": "platform_event_overview",
+    "match": [
+      "what is a platform event",
+      "platform event"
+    ],
+    "search": {
+      "title": "Platform Events",
+      "excerpt": "Platform Events are part of Salesforce's event-driven architecture and let you publish and subscribe to business events.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/platform-events/guide/platform-events.html",
+      "url": "https://developer.salesforce.com/docs/atlas.en-us.platform_events.meta/platform_events/platform_events_intro.htm"
+    },
+    "fetch": {
+      "title": "Platform Events",
+      "excerpt": "A Platform Event is an event-driven mechanism in Salesforce for publishing and subscribing to business events. Use it when you need a decoupled way to send event notifications between systems.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/platform-events/guide/platform-events.html",
+      "url": "https://developer.salesforce.com/docs/atlas.en-us.platform_events.meta/platform_events/platform_events_intro.htm"
+    }
+  },
+  {
+    "name": "latest_api_version_release_notes",
+    "match": [
+      "what is the latest salesforce api version",
+      "latest salesforce api version",
+      "salesforce api version 68.0",
+      "winter 27"
+    ],
+    "search": {
+      "title": "Salesforce Release Notes",
+      "excerpt": "Salesforce API version 68.0 corresponds to the Winter '27 release.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/release-notes/winter-27/api-version-68.0.html",
+      "url": "https://developer.salesforce.com/docs/release-notes/winter-27/api-version-68.0.html"
+    },
+    "fetch": {
+      "title": "Salesforce Release Notes",
+      "excerpt": "The current Salesforce API version is Winter '27 (API version 68.0).",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/release-notes/winter-27/api-version-68.0.html",
+      "url": "https://developer.salesforce.com/docs/release-notes/winter-27/api-version-68.0.html"
+    }
+  },
+  {
+    "name": "apex_heap_limits",
+    "match": [
+      "what is the salesforce apex heap size",
+      "salesforce apex heap size",
+      "apex heap size",
+      "heap size"
+    ],
+    "search": {
+      "title": "Apex Governor Limits",
+      "excerpt": "The Apex heap size limit is 6 MB for synchronous Apex and 12 MB for asynchronous Apex.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/platform/apex/guide/apex_limits.html",
+      "url": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_limits.htm"
+    },
+    "fetch": {
+      "title": "Apex Governor Limits",
+      "excerpt": "Apex heap size is 6 MB for synchronous Apex and 12 MB for asynchronous Apex. Remember that HTTP request and response sizes count toward the total heap size.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/platform/apex/guide/apex_limits.html",
+      "url": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_limits.htm"
+    }
+  },
+  {
+    "name": "winter_20_release_notes",
+    "match": [
+      "what was the salesforce api version in the winter 20 release notes",
+      "salesforce release notes winter '20",
+      "winter 20 release notes",
+      "connector release notes",
+      "api version 47.0"
+    ],
+    "search": {
+      "title": "Salesforce Connector Release Notes",
+      "excerpt": "MuleSoft Salesforce Connector release notes listed Salesforce API versions up to v47.0.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/release-notes/winter-20/salesforce-connector-release-notes.html",
+      "url": "https://developer.salesforce.com/docs/release-notes/winter-20/salesforce-connector-release-notes.html"
+    },
+    "fetch": {
+      "title": "Salesforce Connector Release Notes",
+      "excerpt": "The Winter '20 era documentation referenced API version 47.0 in the connector release notes.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/release-notes/winter-20/salesforce-connector-release-notes.html",
+      "url": "https://developer.salesforce.com/docs/release-notes/winter-20/salesforce-connector-release-notes.html"
+    }
+  }
+]

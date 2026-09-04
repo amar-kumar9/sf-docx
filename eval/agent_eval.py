@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -24,10 +25,16 @@ from app import (
 )
 
 
-DEFAULT_DATASET_PATH = Path("golden_dataset.json")
-DEFAULT_OUTPUT_PATH = Path("agent_eval_results.csv")
-DEFAULT_COMPARE_OUTPUT_PATH = Path("agent_eval_comparison.csv")
-DEFAULT_SUMMARY_PATH = Path("agent_eval_summary.json")
+ROOT_DIR = Path(__file__).resolve().parents[1]
+EVAL_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+DEFAULT_DATASET_PATH = ROOT_DIR / "data" / "golden_dataset.json"
+DEFAULT_OUTPUT_PATH = ROOT_DIR / "artifacts" / "eval" / "agent_eval_results.csv"
+DEFAULT_COMPARE_OUTPUT_PATH = ROOT_DIR / "artifacts" / "eval" / "agent_eval_comparison.csv"
+DEFAULT_SUMMARY_PATH = ROOT_DIR / "artifacts" / "eval" / "agent_eval_summary.json"
+DEFAULT_MCP_FIXTURES_PATH = EVAL_DIR / "eval_mcp_fixtures.json"
 
 STOPWORDS = {
     "salesforce",
@@ -99,6 +106,76 @@ def _word_set(text: str) -> set[str]:
             continue
         words.add(token)
     return words
+
+
+def _clone_mapping(value: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    cloned = json.loads(json.dumps(value))
+    cloned.update(extra)
+    return cloned
+
+
+def _load_mcp_fixtures(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(f"MCP fixture file not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError("MCP fixture file must contain a JSON array.")
+    fixtures: list[dict[str, Any]] = []
+    for index, item in enumerate(payload, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"MCP fixture #{index} is not an object.")
+        fixtures.append(item)
+    return fixtures
+
+
+def _fixture_patterns(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    return []
+
+
+def _fixture_matches(query: str, patterns: list[str]) -> bool:
+    normalized_query = _normalize_text(query)
+    if not patterns:
+        return False
+    return any(_normalize_text(pattern) in normalized_query for pattern in patterns)
+
+
+def _fixture_search_response(query: str, fixtures: list[dict[str, Any]]) -> dict[str, Any]:
+    for fixture in fixtures:
+        patterns = _fixture_patterns(fixture.get("match")) + _fixture_patterns(fixture.get("search_match"))
+        if not _fixture_matches(query, patterns):
+            continue
+        payload = fixture.get("search") or fixture.get("result") or {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"Search fixture '{fixture.get('name', 'unnamed')}' must be an object.")
+        response = _clone_mapping(payload, query=query)
+        response.setdefault("fixture_name", fixture.get("name"))
+        return response
+    return {}
+
+
+def _fixture_fetch_response(document_path: str, fixtures: list[dict[str, Any]]) -> dict[str, Any]:
+    normalized_path = _normalize_text(document_path)
+    for fixture in fixtures:
+        patterns = _fixture_patterns(fixture.get("document_path")) + _fixture_patterns(fixture.get("fetch_match"))
+        if not patterns:
+            search_payload = fixture.get("search") if isinstance(fixture.get("search"), dict) else {}
+            fetch_payload = fixture.get("fetch") if isinstance(fixture.get("fetch"), dict) else {}
+            patterns = _fixture_patterns(search_payload.get("document_path")) + _fixture_patterns(fetch_payload.get("document_path"))
+        if not patterns:
+            continue
+        if not any(_normalize_text(pattern) in normalized_path for pattern in patterns):
+            continue
+        payload = fixture.get("fetch") or fixture.get("search") or {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"Fetch fixture '{fixture.get('name', 'unnamed')}' must be an object.")
+        response = _clone_mapping(payload, document_path=document_path)
+        response.setdefault("fixture_name", fixture.get("name"))
+        return response
+    return {}
 
 
 def _load_samples(dataset_path: Path) -> list[dict[str, Any]]:
@@ -385,6 +462,67 @@ def _patched_google_mode(mode: str):
         app_module.GOOGLE_SEARCH_MODE = original_mode
 
 
+@contextmanager
+def _patched_eval_provider_preference():
+    """Prefer local Ollama during eval so Groq outages do not confound results."""
+    original_value = os.environ.get("GROQ_API_KEY")
+    had_key = "GROQ_API_KEY" in os.environ
+    os.environ["GROQ_API_KEY"] = ""
+    try:
+        yield
+    finally:
+        if had_key:
+            os.environ["GROQ_API_KEY"] = original_value or ""
+        else:
+            os.environ.pop("GROQ_API_KEY", None)
+
+
+@contextmanager
+def _patched_eval_mcp(mode: str, fixtures_path: Path):
+    normalized = (mode or "").strip().lower()
+    if normalized != "fixture":
+        yield
+        return
+
+    fixtures = _load_mcp_fixtures(fixtures_path)
+    original_mcp_search = app_module.mcp_search
+    original_mcp_fetch = app_module.mcp_fetch
+
+    def fixture_search(query: str) -> dict[str, Any]:
+        result = _fixture_search_response(query, fixtures)
+        if result:
+            logger.info(
+                "MCPFixtureSearch | query='{}' | fixture='{}'".format(
+                    query,
+                    result.get("fixture_name") or "unnamed",
+                )
+            )
+        else:
+            logger.info(f"MCPFixtureSearch | query='{query}' | fixture='empty'")
+        return result
+
+    def fixture_fetch(document_path: str) -> dict[str, Any]:
+        result = _fixture_fetch_response(document_path, fixtures)
+        if result:
+            logger.info(
+                "MCPFixtureFetch | path='{}' | fixture='{}'".format(
+                    document_path,
+                    result.get("fixture_name") or "unnamed",
+                )
+            )
+        else:
+            logger.info(f"MCPFixtureFetch | path='{document_path}' | fixture='empty'")
+        return result
+
+    app_module.mcp_search = fixture_search
+    app_module.mcp_fetch = fixture_fetch
+    try:
+        yield
+    finally:
+        app_module.mcp_search = original_mcp_search
+        app_module.mcp_fetch = original_mcp_fetch
+
+
 def _run_session(sample: dict[str, Any]) -> dict[str, Any]:
     query = sample["user_input"]
     trace: dict[str, Any] = {"query": query, "steps": []}
@@ -406,12 +544,16 @@ def _run_session(sample: dict[str, Any]) -> dict[str, Any]:
             "evidence": [],
             "grounding_status": "blocked",
             "provider": None,
+            "provider_used": None,
+            "fallback_reason": None,
         }
     record("guardrail", "passed")
 
     _, fast_llm = get_llm("fast")
     if fast_llm is None:
         response = "❌ No LLM provider available. Configure GROQ_API_KEY or start Ollama."
+        trace["provider_used"] = None
+        trace["fallback_reason"] = "no_fast_llm"
         return {
             "user_input": query,
             "reference": sample["reference"],
@@ -421,6 +563,8 @@ def _run_session(sample: dict[str, Any]) -> dict[str, Any]:
             "evidence": [],
             "grounding_status": "no_llm",
             "provider": None,
+            "provider_used": None,
+            "fallback_reason": "no_fast_llm",
         }
 
     intent_data = classify_intent(query, fast_llm)
@@ -458,6 +602,8 @@ def _run_session(sample: dict[str, Any]) -> dict[str, Any]:
             "evidence": evidence,
             "grounding_status": "blocked",
             "provider": None,
+            "provider_used": None,
+            "fallback_reason": None,
         }
     if relevant_evidence:
         evidence = relevant_evidence
@@ -480,6 +626,8 @@ def _run_session(sample: dict[str, Any]) -> dict[str, Any]:
             "evidence": evidence,
             "grounding_status": "blocked",
             "provider": None,
+            "provider_used": None,
+            "fallback_reason": None,
         }
     record("current_fact_gate", "passed")
 
@@ -487,6 +635,15 @@ def _run_session(sample: dict[str, Any]) -> dict[str, Any]:
     provider_label, synthesis_llm = get_llm(tier)
     if synthesis_llm is None:
         response = "❌ All providers failed. Please configure your API keys or verify Ollama is active."
+        trace["provider_used"] = provider_label
+        trace["fallback_reason"] = "no_synthesis_provider"
+        record(
+            "generate",
+            "fallback",
+            provider=provider_label,
+            provider_used=provider_label,
+            fallback_reason="no_synthesis_provider",
+        )
         return {
             "user_input": query,
             "reference": sample["reference"],
@@ -496,18 +653,27 @@ def _run_session(sample: dict[str, Any]) -> dict[str, Any]:
             "evidence": evidence,
             "grounding_status": "no_synthesis_llm",
             "provider": None,
+            "provider_used": provider_label,
+            "fallback_reason": "no_synthesis_provider",
         }
 
     thread_id = app_module._get_thread_id([])
+    generation_error: str | None = None
     try:
         response = generate_answer(query, evidence, intent_data, conflict_summary, temporal_context, synthesis_llm, thread_id)
     except Exception as exc:
         logger.exception(f"Generation failed | {exc}")
         response = f"❌ Generation error: {exc}"
-    if app_module._is_fallback_content(response):
-        record("generate", "fallback", provider=provider_label)
+        generation_error = str(exc)
+    fallback_reason = "generation_fallback_content" if app_module._is_fallback_content(response) else None
+    if generation_error:
+        fallback_reason = "generation_error"
+    trace["provider_used"] = provider_label
+    trace["fallback_reason"] = fallback_reason
+    if fallback_reason:
+        record("generate", "fallback", provider=provider_label, provider_used=provider_label, fallback_reason=fallback_reason)
     else:
-        record("generate", "ok", provider=provider_label)
+        record("generate", "ok", provider=provider_label, provider_used=provider_label, fallback_reason=None)
 
     response, grounding_status = validate_grounding(response, evidence, fast_llm, query, intent_data)
     record("grounding", grounding_status)
@@ -534,14 +700,22 @@ def _run_session(sample: dict[str, Any]) -> dict[str, Any]:
         "evidence": evidence,
         "grounding_status": grounding_status,
         "provider": provider_label,
+        "provider_used": provider_label,
+        "fallback_reason": fallback_reason,
         "intent": intent_data.get("intent"),
         "sample_type": sample.get("type", "default"),
     }
 
 
-def _run_rows(samples: list[dict[str, Any]], google_mode: str, variant: str) -> list[dict[str, Any]]:
+def _run_rows(
+    samples: list[dict[str, Any]],
+    google_mode: str,
+    variant: str,
+    mcp_mode: str,
+    mcp_fixtures_path: Path,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    with _patched_google_mode(google_mode):
+    with _patched_google_mode(google_mode), _patched_eval_provider_preference(), _patched_eval_mcp(mcp_mode, mcp_fixtures_path):
         for sample in samples:
             result = _run_session(sample)
             passed, failures, meta = _grade_session(
@@ -571,6 +745,8 @@ def _run_rows(samples: list[dict[str, Any]], google_mode: str, variant: str) -> 
                 "evidence_count": meta["evidence_count"],
                 "response_is_fallback": meta["response_is_fallback"],
                 "sample_type": meta["sample_type"],
+                "provider_used": result.get("provider_used") or result.get("provider"),
+                "fallback_reason": result.get("fallback_reason") or result.get("trace", {}).get("fallback_reason"),
             }
             for rubric_name, score in rubric["rubric_scores"].items():
                 row[rubric_name] = score
@@ -709,7 +885,9 @@ def run_eval(
     dataset_path: str = str(DEFAULT_DATASET_PATH),
     output_path: str = str(DEFAULT_OUTPUT_PATH),
     summary_path: str = str(DEFAULT_SUMMARY_PATH),
-    google_mode: str = "hybrid",
+    google_mode: str = "none",
+    mcp_mode: str = "fixture",
+    mcp_fixtures_path: str = str(DEFAULT_MCP_FIXTURES_PATH),
 ) -> pd.DataFrame:
     dataset_file = Path(dataset_path)
     if not dataset_file.exists():
@@ -718,7 +896,13 @@ def run_eval(
     if not samples:
         raise ValueError("Dataset is empty.")
 
-    rows = _run_rows(samples, google_mode=google_mode, variant="baseline")
+    rows = _run_rows(
+        samples,
+        google_mode=google_mode,
+        variant="baseline",
+        mcp_mode=mcp_mode,
+        mcp_fixtures_path=Path(mcp_fixtures_path),
+    )
     df = _write_report(rows, Path(output_path))
     summary = _build_summary(df, label="session_eval", source=str(dataset_file))
     _write_summary_json(summary, Path(summary_path))
@@ -733,7 +917,9 @@ def run_compare(
     output_path: str = str(DEFAULT_COMPARE_OUTPUT_PATH),
     summary_path: str = str(DEFAULT_SUMMARY_PATH),
     baseline_google_mode: str = "none",
-    candidate_google_mode: str = "hybrid",
+    candidate_google_mode: str = "none",
+    mcp_mode: str = "fixture",
+    mcp_fixtures_path: str = str(DEFAULT_MCP_FIXTURES_PATH),
     fail_on_regression: bool = False,
     max_pass_drop: float = 0.0,
     max_rubric_drop: float = 0.0,
@@ -745,8 +931,20 @@ def run_compare(
     if not samples:
         raise ValueError("Dataset is empty.")
 
-    baseline_rows = _run_rows(samples, google_mode=baseline_google_mode, variant="baseline")
-    candidate_rows = _run_rows(samples, google_mode=candidate_google_mode, variant="candidate")
+    baseline_rows = _run_rows(
+        samples,
+        google_mode=baseline_google_mode,
+        variant="baseline",
+        mcp_mode=mcp_mode,
+        mcp_fixtures_path=Path(mcp_fixtures_path),
+    )
+    candidate_rows = _run_rows(
+        samples,
+        google_mode=candidate_google_mode,
+        variant="candidate",
+        mcp_mode=mcp_mode,
+        mcp_fixtures_path=Path(mcp_fixtures_path),
+    )
     combined = _write_report(baseline_rows + candidate_rows, Path(output_path))
     baseline_df = combined[combined["variant"] == "baseline"].copy()
     candidate_df = combined[combined["variant"] == "candidate"].copy()
@@ -790,10 +988,12 @@ def main() -> None:
     parser.add_argument("--dataset", default=str(DEFAULT_DATASET_PATH), help="Path to the JSON golden dataset.")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT_PATH), help="CSV output path.")
     parser.add_argument("--summary", default=str(DEFAULT_SUMMARY_PATH), help="JSON summary output path.")
-    parser.add_argument("--google-mode", default="hybrid", help="Google mode for a single run: none|hybrid|fallback|always.")
+    parser.add_argument("--google-mode", default="none", help="Google mode for a single run: none|hybrid|fallback|always.")
+    parser.add_argument("--mcp-mode", default="fixture", help="MCP mode for eval: fixture|live.")
+    parser.add_argument("--mcp-fixtures", default=str(DEFAULT_MCP_FIXTURES_PATH), help="Path to the MCP fixture JSON file.")
     parser.add_argument("--compare", action="store_true", help="Run baseline and candidate variants and compare them.")
     parser.add_argument("--baseline-google-mode", default="none", help="Google mode for the baseline comparison run.")
-    parser.add_argument("--candidate-google-mode", default="hybrid", help="Google mode for the candidate comparison run.")
+    parser.add_argument("--candidate-google-mode", default="none", help="Google mode for the candidate comparison run.")
     parser.add_argument("--fail-on-regression", action="store_true", help="Exit non-zero if the candidate regresses.")
     parser.add_argument("--max-pass-drop", type=float, default=0.0, help="Allowed drop in overall pass rate before failing.")
     parser.add_argument("--max-rubric-drop", type=float, default=0.0, help="Allowed drop in rubric average before failing.")
@@ -806,6 +1006,8 @@ def main() -> None:
             summary_path=args.summary,
             baseline_google_mode=args.baseline_google_mode,
             candidate_google_mode=args.candidate_google_mode,
+            mcp_mode=args.mcp_mode,
+            mcp_fixtures_path=args.mcp_fixtures,
             fail_on_regression=args.fail_on_regression,
             max_pass_drop=args.max_pass_drop,
             max_rubric_drop=args.max_rubric_drop,
@@ -816,6 +1018,8 @@ def main() -> None:
             output_path=args.output,
             summary_path=args.summary,
             google_mode=args.google_mode,
+            mcp_mode=args.mcp_mode,
+            mcp_fixtures_path=args.mcp_fixtures,
         )
 
 

@@ -1,5 +1,5 @@
 [
-  {
+{
     "user_input": "What is the latest Salesforce API version?",
     "reference": "The current Salesforce API version is Winter '27 (API version 68.0).",
     "reference_contexts": [

@@ -19,7 +19,9 @@ from prompts import (
     QUERY_PLANNER_PROMPT,
     TEMPORAL_FACT_VALIDATION_PROMPT,
     EVIDENCE_CONFLICT_RESOLUTION_PROMPT,
+    CURRENT_FACT_DIRECT_ANSWER_PROMPT,
     DEFINITION_FIRST_SYNTHESIS_PROMPT,
+    SOQL_101_HINT_PROMPT,
     RESEARCH_SYNTHESIS_PROMPT,
     ARCHITECTURE_REASONING_PROMPT,
     CODE_REVIEW_PROMPT,
@@ -779,11 +781,11 @@ def classify_intent(message: str, llm) -> dict:
 # Search Query Planning
 # ---------------------------------------------------------------------------
 
-def build_search_queries(message: str, intent_data: dict, llm) -> list[str]:
+def build_search_queries(message: str, intent_data: dict, llm, temporal_context: dict | None = None) -> list[str]:
     depth = intent_data.get("research_depth", "standard")
     max_q = SEARCH_BUDGET.get(depth, 2)
     features = intent_data.get("salesforce_features", [])
-    temporal = _determine_temporal_context(message, intent_data)
+    temporal = temporal_context or _determine_temporal_context(message, intent_data)
     boosters = _temporal_search_boosters(message, temporal)
     definition_intent = _is_definition_question(message, intent_data)
     definition_boosters = _definition_search_boosters(message, intent_data) if definition_intent else []
@@ -1064,6 +1066,58 @@ def _definition_evidence_is_sufficient(evidence: list[dict], topic_terms: set[st
     return any(_definition_page_bonus(item) > 0 for item in relevant)
 
 
+def _evidence_sufficiency_stage(
+    evidence: list[dict],
+    intent_data: dict,
+    message: str,
+    topic_terms: set[str],
+    require_authoritative: bool = False,
+) -> dict:
+    """Canonical sufficiency gate for retrieval.
+
+    Returns a small diagnostic payload so retrieval can explain why it stopped
+    or continued searching.
+    """
+    non_empty = [item for item in evidence if item.get("excerpt")]
+    definition_intent = _is_definition_question(message, intent_data)
+    topic_match = not topic_terms or any(_is_relevant(item, topic_terms) for item in non_empty)
+    definition_satisfied = True
+
+    if require_authoritative and not _has_authoritative_salesforce_source(non_empty):
+        return {
+            "sufficient": False,
+            "reason": "missing_authoritative_source",
+            "topic_match": topic_match,
+            "definition_satisfied": definition_satisfied,
+        }
+
+    if not non_empty:
+        return {
+            "sufficient": False,
+            "reason": "no_evidence",
+            "topic_match": False,
+            "definition_satisfied": False,
+        }
+
+    if definition_intent:
+        definition_satisfied = _definition_evidence_is_sufficient(non_empty, topic_terms)
+
+    sufficient = _is_sufficient(evidence, intent_data, require_authoritative=require_authoritative)
+    sufficient = sufficient and topic_match and definition_satisfied
+    reason = "sufficient" if sufficient else "insufficient"
+    if not topic_match:
+        reason = "topic_mismatch"
+    elif definition_intent and not definition_satisfied:
+        reason = "definition_not_satisfied"
+
+    return {
+        "sufficient": sufficient,
+        "reason": reason,
+        "topic_match": topic_match,
+        "definition_satisfied": definition_satisfied,
+    }
+
+
 def _merge_unique_evidence(existing: list[dict], new_items: list[dict]) -> None:
     seen = {_evidence_identity(item) for item in existing}
     for item in new_items:
@@ -1123,16 +1177,8 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
     evidence: list[dict] = []
 
     # Build focused queries
-    queries = build_search_queries(message, intent_data, llm)
+    queries = build_search_queries(message, intent_data, llm, temporal)
     topic_terms = _topic_terms(message, intent_data)
-    if temporal.get("historical_release_requested") and temporal.get("requested_release"):
-        release_query = f"{message} {temporal['requested_release']} Salesforce documentation"
-        if release_query not in queries:
-            queries.insert(0, release_query)
-    elif temporal.get("temporal_validation_required"):
-        current_query = f"{message} current Salesforce documentation release notes"
-        if current_query not in queries:
-            queries.insert(0, current_query)
 
     logger.info(f"SearchBudget={search_budget} | Queries={len(queries)}")
 
@@ -1151,15 +1197,14 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
                 )
                 _merge_unique_evidence(evidence, google_hits)
 
-        definition_satisfied = True
-        if _is_definition_question(message, intent_data):
-            definition_satisfied = any(_definition_page_bonus(item) > 0 for item in evidence)
-
-        if _is_sufficient(
+        sufficiency = _evidence_sufficiency_stage(
             evidence,
             intent_data,
+            message,
+            topic_terms,
             require_authoritative=require_authoritative,
-        ) and any(_is_relevant(item, topic_terms) for item in evidence) and definition_satisfied:
+        )
+        if sufficiency["sufficient"]:
             logger.info(f"EvidenceSufficient=true after {i} search(es)")
             break
 
@@ -1210,10 +1255,20 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
                         )
                         _merge_unique_evidence(evidence, google_hits)
 
-            if _definition_evidence_is_sufficient(evidence, topic_terms):
+            sufficiency = _evidence_sufficiency_stage(
+                evidence,
+                intent_data,
+                message,
+                topic_terms,
+                require_authoritative=require_authoritative,
+            )
+            if sufficiency["sufficient"]:
                 logger.info("DefinitionRetrievalRetry=resolved")
             else:
-                logger.warning("DefinitionRetrievalRetry=insufficient | continuing with best available evidence")
+                logger.warning(
+                    "DefinitionRetrievalRetry=insufficient | "
+                    f"reason={sufficiency['reason']} | continuing with best available evidence"
+                )
 
     # Always fetch the top doc when we have a document path — search excerpts are
     # capped at MCP_MAX_TOKENS and too thin for synthesis + grounding on their own.
@@ -1461,8 +1516,10 @@ def resolve_evidence_conflicts(evidence: list[dict], intent_data: dict, llm, mes
 # System Prompt Composition
 # ---------------------------------------------------------------------------
 
-def build_synthesis_prompt(message: str, intent_data: dict) -> str:
+def build_synthesis_prompt(message: str, intent_data: dict, current_fact_verified: bool = False) -> str:
     parts = [RESEARCH_SYNTHESIS_PROMPT]
+    if current_fact_verified:
+        parts.append(CURRENT_FACT_DIRECT_ANSWER_PROMPT)
     if _is_definition_question(message, intent_data):
         parts.append(DEFINITION_FIRST_SYNTHESIS_PROMPT)
     intent = intent_data.get("intent", "general")
@@ -1472,6 +1529,10 @@ def build_synthesis_prompt(message: str, intent_data: dict) -> str:
 
     if intent in ("code_review", "troubleshooting") or intent_data.get("requires_code_analysis"):
         parts.append(CODE_REVIEW_PROMPT)
+
+    lower_message = message.lower()
+    if any(token in lower_message for token in ("soql 101", "too many soql", "bulkify", "governor limit", "too many soql queries")):
+        parts.append(SOQL_101_HINT_PROMPT)
 
     return "\n\n---\n\n".join(parts)
 
@@ -1498,11 +1559,12 @@ def _get_thread_id(history: list) -> str:
 
 
 def generate_answer(message: str, evidence: list[dict], intent_data: dict, conflict_summary: dict, temporal_context: dict, llm, thread_id: str = "default") -> str:
-    system_prompt = build_synthesis_prompt(message, intent_data)
     synthesis_evidence = evidence
     if _is_current_fact_request(intent_data, temporal_context):
         synthesis_evidence = _filter_current_fact_evidence(evidence)
     ordered_evidence = _sort_evidence_for_intent(synthesis_evidence, intent_data, message)
+    current_fact_verified = _is_current_fact_request(intent_data, temporal_context) and _has_authoritative_salesforce_source(ordered_evidence)
+    system_prompt = build_synthesis_prompt(message, intent_data, current_fact_verified=current_fact_verified)
 
     if ordered_evidence:
         ev_lines = ["## Retrieved Evidence\n"]
@@ -1749,7 +1811,17 @@ def run_agent(message: str, history: list) -> str:
     # Step 5 — select model tier for synthesis
     tier = intent_data.get("model_tier", "standard")
     provider_label, synthesis_llm = get_llm(tier)
+    trajectory["provider_used"] = provider_label
     if not synthesis_llm:
+        trajectory["fallback_reason"] = "no_synthesis_provider"
+        _record(
+            "generate",
+            "fallback",
+            provider=provider_label,
+            provider_used=provider_label,
+            fallback_reason="no_synthesis_provider",
+        )
+        logger.info(f"Trajectory | {trajectory}")
         return "❌ All providers failed. Please configure your API keys or verify Ollama is active."
 
     # Step 6 — generate answer (session-isolated thread_id)
@@ -1759,10 +1831,20 @@ def run_agent(message: str, history: list) -> str:
         answer = generate_answer(message, evidence, intent_data, conflict_summary, temporal_context, synthesis_llm, thread_id)
     except Exception as e:
         logger.exception(f"Generation failed | {e}")
+        trajectory["fallback_reason"] = "generation_error"
+        logger.info(f"Trajectory | {trajectory}")
         return f"❌ Generation error: {e}"
-    if _is_fallback_content(answer):
+    fallback_reason = "generation_fallback_content" if _is_fallback_content(answer) else None
+    trajectory["fallback_reason"] = fallback_reason
+    if fallback_reason:
         logger.warning("ResponseUsedFallbackContent=true | kind=synthesis")
-    _record("generate", "fallback" if _is_fallback_content(answer) else "ok", provider=provider_label)
+    _record(
+        "generate",
+        "fallback" if fallback_reason else "ok",
+        provider=provider_label,
+        provider_used=provider_label,
+        fallback_reason=fallback_reason,
+    )
 
     # Step 7 — grounding check (lightweight, uses fast LLM)
     answer, grounding_status = validate_grounding(answer, evidence, classifier_llm, message, intent_data)

@@ -6,6 +6,7 @@ __pycache__/
 .mypy_cache/
 logs/
 .sf/
+artifacts/
 *.py[cod]
 *.log
 agent_eval_*.csv
