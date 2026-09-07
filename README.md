@@ -1,33 +1,18 @@
 # Salesforce Docs Agent
 
-A local AI agent that answers Salesforce questions by retrieving and grounding answers against live Salesforce documentation — not model training data.
+Grounds Salesforce design answers in **live official docs**. In Cursor, the model is the agent. Search goes through the Salesforce Docs MCP. There is no `.env` on that path.
 
-The **Python agent always owns retrieval, Architecture Center routing, and grounding**. Synthesis uses whatever LLM is on *this* machine. If none is configured, Python still returns the retrieved docs (retrieval-only), and Cursor can synthesize from that pack.
+## Cursor (this is the product)
 
-## Two ways to run it
+1. Open this folder in Cursor.
+2. Enable the **salesforce-docs** MCP if Cursor prompts (project file: `.cursor/mcp.json`).
+3. Ask a design question.
 
-| Where you are | Who writes the answer | What you run |
-|---|---|---|
-| Cursor on a new laptop (no Groq/Ollama key) | Cursor (local agent) | Ask in chat. The project skill runs `python cli.py retrieve --json`. |
-| Gradio / CLI with a key or Ollama | Python agent | `python cli.py ui` or `python cli.py ask "..."` |
+The skill `.cursor/skills/sfdocx-capability-loop/SKILL.md` tells the agent to search capability-first, keep going until Architecture Center hits, and refuse when docs do not support a product. For heap, API version, and other seasonal facts it **must open Help release notes in the browser** — Salesforce Docs MCP often still has last season’s `apex_gov_limits` page and will miss `release-notes.rn_*` articles.
 
-`python cli.py status` shows what this machine can use.
+## Optional: Python CLI / Gradio
 
-## Connect an LLM (pick one)
-
-Copy `.env.example` to `.env`, or use the Gradio sidebar. Keys stay in `.env` (gitignored).
-
-1. **Cursor** — no key. The skill in `.cursor/skills/sfdc-docs-agent/` retrieves via Python, then the local agent writes the answer.
-2. **Ollama** — install [Ollama](https://ollama.com), pull a model, leave `LLM_PROVIDER=auto`.
-3. **LM Studio** — start the local server (`http://127.0.0.1:1234/v1`).
-4. **Cloud key** — set any one of `GROQ_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`.
-5. **Custom OpenAI-compatible server** — `LLM_PROVIDER=openai_compatible` plus `LLM_BASE_URL` and `LLM_API_KEY` if required.
-
-`LLM_PROVIDER=auto` uses the first ready cloud key, then Ollama, then LM Studio. Set `LLM_PREFER_LOCAL=true` to try local runtimes first.
-
-If nothing is configured, `python cli.py ask` still retrieves Salesforce docs and prints them as `[retrieval-only]`.
-
-## Commands
+`python cli.py` is a separate app for evals and a local UI. It is **not** what the Cursor skill runs. That path uses `.env` for LLM keys and `MCP_URL` (a different HTTP index). Copy `.env.example` only if you are running Gradio or `python cli.py ask`.
 
 ```bash
 python cli.py status
@@ -42,28 +27,15 @@ python cli.py ui
 python eval/agent_eval.py --compare --baseline-google-mode none --candidate-google-mode hybrid
 ```
 
-## Diagnose retrieval
-
-```bash
-python scripts/diagnose_retrieval.py
-```
-
 ## Layout
 
-- `app.py` — retrieval pipeline, grounding, temporal validation, answer synthesis
-- `solution_architect.py` — business requirement → Salesforce capability translation
-- `providers.py` — pluggable LLMs and retrieve-only fallback
-- `cli.py` — status / retrieve / ask / ui
-- `prompts.py` — prompt templates
-- `data/` — golden dataset
-- `eval/` — eval harness, MCP fixtures, architecture probes
-- `scripts/` — retrieval diagnostics
-- `tests/` — pipeline tests
-- `.cursor/skills/sfdc-docs-agent/` — Cursor skill (host agent + Python retrieval)
+- `.cursor/skills/sfdocx-capability-loop/` — Cursor skill (agent + Salesforce Docs MCP)
+- `.cursor/mcp.json` — project Salesforce Docs MCP
+- `app.py` / `cli.py` / `ui/` — optional Python retrieve + Gradio
+- `solution_architect.py` — capability translation used by the Python path and evals
+- `data/` / `eval/` / `tests/` — golden set and harness
 
 ## Notes
 
-- Keep `data/golden_dataset.json` versioned.
-- Keep `eval/eval_mcp_fixtures.json` versioned.
-- Generated logs and eval outputs belong under `artifacts/` or `logs/`.
 - Never commit `.env`.
+- Generated logs belong under `artifacts/` or `logs/`.
