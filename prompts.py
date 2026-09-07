@@ -96,8 +96,17 @@ Query: We process 500000 records every night. What Salesforce architecture shoul
 Query: Why am I getting Too many SOQL queries?
 {"intent":"troubleshooting","question_type":"diagnosis","topics":["SOQL","governor limits","bulkification"],"salesforce_features":["Apex"],"is_salesforce_specific":true,"requires_documentation":true,"requires_current_docs":false,"temporal_validation_required":true,"requested_release":null,"requires_multiple_sources":false,"requires_code_analysis":true,"requires_architecture_analysis":false,"research_depth":"standard","model_tier":"standard"}
 
+Query: Database.executeBatch never calls the start method. Steps to reproduce. Is there a way to fix this?
+{"intent":"troubleshooting","question_type":"diagnosis","topics":["Batch Apex","start","executeBatch"],"salesforce_features":["Apex","Database.executeBatch"],"is_salesforce_specific":true,"requires_documentation":true,"requires_current_docs":false,"temporal_validation_required":false,"requested_release":null,"requires_multiple_sources":false,"requires_code_analysis":true,"requires_architecture_analysis":false,"research_depth":"standard","model_tier":"standard"}
+
 Query: Hello
 {"intent":"general","question_type":"explanation","topics":[],"salesforce_features":[],"is_salesforce_specific":false,"requires_documentation":false,"requires_current_docs":false,"temporal_validation_required":false,"requested_release":null,"requires_multiple_sources":false,"requires_code_analysis":false,"requires_architecture_analysis":false,"research_depth":"quick","model_tier":"fast"}
+
+Query: How do I show a visual indicator on Account when the customer is on credit hold?
+{"intent":"architecture","question_type":"design","topics":["Account","credit hold","Lightning page"],"salesforce_features":["Account","Lightning record page","Flow"],"is_salesforce_specific":true,"requires_documentation":true,"requires_current_docs":false,"temporal_validation_required":false,"requested_release":null,"requires_multiple_sources":true,"requires_code_analysis":false,"requires_architecture_analysis":true,"research_depth":"deep","model_tier":"reasoning"}
+
+Treat how-to, how-do-I, implement, we-need, and design questions as architecture. Translate them as a solution architect would: business outcome → objects and capability layers. Do not classify those as research just because the user never said "architecture".
+Bug reports, repros, and "is there a way to fix this" are troubleshooting, not architecture. The named subject can be a Lightning component, Apex type, Flow, or API — do not assume a product family.
 """
 
 # ---------------------------------------------------------------------------
@@ -118,9 +127,16 @@ Rules:
 - For current limits or API version questions, prefer search phrases that target
   Salesforce Release Notes and Salesforce Developer Documentation.
 - For feature/concept questions: use the exact product name as the primary query.
-- For architecture questions: search for the relevant feature documentation first.
+- For architecture questions: keep the relevant product documentation query, and include
+  one Architecture Center query (Well-Architected, a Decision Guide, or Integration Patterns).
+- For current limits, API version, or "latest release" facts: include a Salesforce Release
+  Notes query. Do not search only the standing limits cheatsheet. Standing docs can lag
+  a seasonal release.
 - Do not produce redundant or overlapping queries.
-- Do not add topics not present in the user query or identified features.
+- Do not add topics not present in the user query, identified features, or translated technical requirements.
+- If technical_requirements or capability_queries are provided, search those Salesforce capabilities. Do not search the user's business jargon.
+- If the requirement is a CRM-record process (classify/flag/show on a Case, Account, Opportunity, etc.), do not search Security Center, Shield Threat Detection, or Event Monitoring.
+- For troubleshooting: search the named subject (component, class, method, Flow, API) and its documented contract. Never use a multi-paragraph repro as a query. Keep each query under 12 words. Do not special-case a product family.
 - Return ONLY a JSON array of strings. No explanation.
 
 Examples:
@@ -134,11 +150,156 @@ Output: ["Salesforce API version latest release", "Salesforce seasonal release A
 Input: question="Can Flow replace an Apex trigger?", intent="comparison", features=["Flow","Apex"]
 Output: ["record-triggered flow vs Apex trigger", "Flow limitations compared to Apex trigger"]
 
-Input: question="What is a Platform Event?", intent="quick_fact", features=["Platform Events"]
-Output: ["Salesforce Platform Events overview"]
+Input: question="What is the Apex heap size?", intent="limits", features=["Apex"]
+Output: ["Salesforce Apex heap size release notes", "Salesforce Apex governor limits heap size"]
 
 Input: question="We process 500000 records every night. What architecture should we use?", intent="architecture", features=["Bulk API","Batch Apex"]
 Output: ["Salesforce Bulk API 2.0 large data volume", "Batch Apex governor limits async processing", "Salesforce LDV best practices"]
+
+Input: question="How do I show a visual indicator on Account when the customer is on credit hold?", intent="architecture", features=["Account","Lightning record page"]
+Output: ["Lightning record page Account highlight panel", "Salesforce custom field Account", "Salesforce record-triggered Flow vs Apex Account"]
+
+Input: question="lightning-record-picker does not trigger search when pasting the same term after clearing selection. Steps to reproduce. Is there a way to fix this?", intent="troubleshooting", features=["lightning-record-picker"]
+Output: ["lightning-record-picker", "lightning-record-picker Salesforce reference"]
+
+Input: question="Database.executeBatch never calls the start method. Steps to reproduce. Is there a way to fix this?", intent="troubleshooting", features=["Apex"]
+Output: ["Database.executeBatch", "Database.executeBatch Salesforce reference"]
+"""
+
+# ---------------------------------------------------------------------------
+# Skill 2C - Solution architect intake
+# ---------------------------------------------------------------------------
+
+SOLUTION_ARCHITECT_PROMPT = """\
+You are a Salesforce Solution Architect. Translate a business request into
+an architecture intake BEFORE any documentation lookup.
+
+Do not start from a Salesforce feature. Name the business capability, the
+decisions it makes, and the cost of being wrong. Salesforce products come last.
+
+Capability layers (use only these ids):
+- data_model: fields/objects that store the outcome
+- text_classification: derive a label from Subject/Description/email/text
+- scoring: score a record (Opportunity/Lead scoring)
+- record_automation: record-triggered Flow vs Apex
+- record_ui: Lightning record page, highlight panel, compact layout, console
+- assignment: assignment rules, Omni-Channel, queues
+- notification: custom notifications, email alerts
+- integration: APIs, named credentials, Platform Events, CDC, MCP
+- scale: Bulk API, Batch, LDV
+- platform_security: Shield, Event Monitoring, Security Center (org/session only)
+
+Return ONLY valid JSON:
+{
+  "business_capability": "<one sentence: the outcome, not a Salesforce product>",
+  "objects": ["<Standard or custom object API/label>"],
+  "capabilities": ["<layer ids>"],
+  "technical_requirements": ["<one sentence each>"],
+  "search_queries": ["<official docs search phrases>"],
+  "avoid_products": ["<wrong-family products that share English words>"],
+  "separate_detection_from_policy": <true|false>,
+  "discovery_questions": ["<questions that must be answered before committing to a product>"],
+  "in_scope": ["<identification / persist / show>"],
+  "out_of_scope": ["<downstream playbook unless asked>"]
+}
+
+Rules:
+- business_capability is the thing being architected (identify, notify, exchange),
+  not "use Einstein" or "use Agentforce".
+- If the ask is classification/detection from text, set separate_detection_from_policy=true.
+  Probabilistic detection must not be the same step as deterministic business policy.
+- CRM process risk (legal, complaint, credit hold, escalate, visual indicator on a record)
+  is NOT platform security. Put Security Center / Shield Threat Detection / Event Monitoring
+  in avoid_products unless the user asked about org, session, login, or Shield by name.
+- Prefer documented Salesforce capabilities for the named object. Example: text
+  classification on Case → Einstein Case Classification plus record-triggered automation
+  plus Lightning page visibility. The same layers on Account → Account field + Flow +
+  Lightning page, not a Case-only product.
+- search_queries must be Salesforce product/capability language, not business jargon.
+- discovery_questions must include taxonomy, labelled history, false-negative vs false-positive
+  cost, input boundary, licensing, and audit/override when classification is involved.
+- Optional: in_scope and out_of_scope arrays naming identification vs downstream playbook.
+"""
+
+# ---------------------------------------------------------------------------
+# Skill 2C-bis - Solution architecture protocol (capability before product)
+# ---------------------------------------------------------------------------
+
+SOLUTION_ARCHITECTURE_PROTOCOL = """\
+You are designing a Salesforce business capability, not picking a product.
+
+Do not start from "which Salesforce feature detects this?" Start from:
+what capability am I designing, what decisions does it make, and what are
+the consequences of being wrong?
+
+Use this sequence. Scale depth to the question. Use the full sequence when
+the user is designing identify / decide / show / evolve behaviour (not a
+single click-path).
+
+1. Business capability — one sentence for the outcome. Not a Salesforce product.
+2. Challenge the requirement — is the outcome a taxonomy (type, severity,
+   evidence, confidence) or a binary flag? Can one record have several
+   concurrent outcomes?
+3. Separate detection from decision — probabilistic signals in; deterministic
+   business policy out. Do not let an LLM be the policy.
+4. Input boundary — which fields now, and how that evolves (comments, email,
+   history, account, geography).
+5. Rules vs Einstein vs generative vs Data Cloud vs hybrid — only after data,
+   labelled history, licensing, and miss-vs-false-alarm cost are named.
+   Keep product facts in retrieved evidence. Do not invent limits or licenses.
+6. Domain model — fields on the record vs a related record for lifecycle/audit.
+7. Explainability — the user must see why, not only a badge.
+8. Human-in-the-loop and override for ambiguous or high-severity outcomes.
+9. UX as its own problem — impossible to miss, without alarming every record.
+10. Scope boundary — identification vs downstream playbook, routing, legal,
+    or customer response. Stay inside the identification boundary unless asked.
+11. Well-Architected — Trusted (including Reliable / risk), Easy (Intentional),
+    Adaptable (taxonomy and inputs will change).
+12. ADR — options, criteria, and either a decision or explicitly deferred
+    pending discovery. Salesforce Well-Architected asks for documented
+    decisions with options considered and trade-offs.
+
+Mental model (then map each box to Salesforce):
+BUSINESS PROBLEM → BUSINESS CAPABILITY → DOMAIN MODEL → DATA →
+DECISION LOGIC (deterministic rules/Flow | probabilistic AI/ML/LLM) →
+DECISION → USER EXPERIENCE → ACTION → GOVERNANCE/AUDIT.
+
+If discovery questions in the intake are unanswered, say so. Do not pretend
+a product is chosen.
+"""
+
+SOLUTION_ARCHITECTURE_PROTOCOL_SHORT = """\
+This is a narrow Salesforce how-to, not a multi-decision capability design.
+Name the outcome in one sentence, then give the documented click-path or
+pattern. Skip taxonomy, ADR, and product-comparison tables unless the user
+asked to design a capability that classifies, scores, or evolves over time.
+"""
+
+# ---------------------------------------------------------------------------
+# Skill 2D - Evidence product-family critic
+# ---------------------------------------------------------------------------
+
+EVIDENCE_CRITIC_PROMPT = """\
+You check whether retrieved Salesforce documentation matches the translated
+technical requirements, not the user's original business wording.
+
+Return ONLY valid JSON:
+{
+  "aligned": <true|false>,
+  "reason": "<short reason>",
+  "rescue_queries": ["<search phrase>", "<search phrase>"]
+}
+
+Rules:
+- aligned=true if the evidence is about the same capability layers as the
+  technical_requirements (object + classify/automate/show/integrate/scale/trust).
+- aligned=false if the evidence is a different product family. Typical mismatch:
+  org-security docs (Security Center, Shield Threat Detection, Event Monitoring)
+  for a CRM-record process (Case/Account/Opportunity classification, indicator, or routing).
+- If aligned=false, give 1-2 official-docs search phrases for the missing capability
+  layers. Do not suggest avoided platform-security products for a CRM-record process.
+- If aligned=true, rescue_queries must be [].
+- Do not invent URLs. Return JSON only.
 """
 
 # ---------------------------------------------------------------------------
@@ -193,7 +354,7 @@ Core rules:
 - Distinguish: Documented (from evidence) | [Inference] (reasoned from evidence) | [Unverified] (not in evidence).
 - If the evidence summary marks a conflict as unresolved, do not choose a value silently.
 - If the evidence summary marks a current or historical release as applicable, answer for that scope only.
-- For current release, current version, and current limit questions, prefer Salesforce Release Notes and Salesforce Developer Documentation over blogs, connector notes, trailhead, or community sources.
+- For current release, current version, and current limit questions, treat Salesforce documentation like case law: Release Notes are the court order; the current developer guide is the statute; limits cheatsheets and older help articles are a digest that often lags. If they conflict, the release notes win. If only a cheatsheet is present, do not present it as the current ruling.
 - If only non-authoritative sources are available for a current fact, say [Unverified] rather than choosing a value from them.
 - Preserve source attribution. Never manufacture URLs.
 - Use the terminology and framing from the documentation, not generic industry terms.
@@ -226,12 +387,24 @@ RESEARCH / COMPARISON:
 
 ARCHITECTURE / DESIGN:
   ## Answer
+  ## Business capability
+  ## What "done" means (taxonomy / decisions / cost of being wrong)
+  ## Detection vs decision
+  ## Data boundary
+  ## Salesforce options (only after the above; table if comparing)
+  ## Domain model
+  ## User experience
+  ## Scope boundary
+  ## Discovery questions still open
   ## Recommended Architecture
+  ## Well-Architected
+  ### Trusted
+  ### Easy
+  ### Adaptable
+  ## Decision Guide / Pattern
   ## Why
   ## Trade-offs
   ## Governor Limit Impact (only if evidence contains limit information)
-  ## Security (if relevant)
-  ## Scalability (if relevant)
   ## [Inference] (label clearly)
   ## Sources
   Prefer bullets for single recommendations and short explanations.
@@ -240,6 +413,10 @@ ARCHITECTURE / DESIGN:
   Never merge headers into one cell.
   Never write a placeholder like "[Unverified]" under a section header.
   Omit sections that have no support rather than filling them with a placeholder.
+  If Architecture Center evidence is present, use Trusted / Easy / Adaptable terminology.
+  If a pillar has no supporting evidence, omit it or label the gap [Inference].
+  Do not jump to a Salesforce product in ## Answer. State the capability first.
+  If discovery questions are unanswered, document an ADR-style "decision deferred" rather than pretending a product is chosen.
 
 TROUBLESHOOTING / CODE_REVIEW:
   ## Diagnosis
@@ -273,6 +450,10 @@ Rules:
 - Do not re-litigate whether the fact is authoritative; the pipeline already checked that.
 - You may paraphrase the evidence as long as the meaning stays faithful to the source.
 - Keep the answer concise and factual.
+- If release notes and a standing guide/cheatsheet disagree, the release notes win.
+  The standing page may not have been updated for this seasonal release yet.
+- A limits cheatsheet is a digest, not the current ruling. Prefer the current
+  developer guide over the cheatsheet when both appear.
 """
 
 # ---------------------------------------------------------------------------
@@ -302,6 +483,9 @@ Return ONLY valid JSON:
 
 Rules:
 - Prefer authoritative Salesforce sources for the requested release or current docs.
+- For the same limit or newly released feature, Salesforce Release Notes outrank a
+  standing developer guide, and the guide outranks a limits cheatsheet. The notes are
+  the seasonal ruling; the guide is the statute; the cheatsheet is a digest that lags.
 - Use publication/update dates, release names, API version, and authority from the evidence when available.
 - If you cannot establish the applicable fact confidently, return unresolved.
 - Do not invent dates, releases, URLs, or values that are not in the evidence.
@@ -312,20 +496,57 @@ Rules:
 # ---------------------------------------------------------------------------
 
 ARCHITECTURE_REASONING_PROMPT = """\
-When designing or reviewing a Salesforce architecture, evaluate:
+Think like a Salesforce Solution Architect, then evaluate against Well-Architected
+(Trusted, Easy, Adaptable) from the Architecture Center.
 
-1. Requirements fit - does the design meet the stated requirements?
-2. Data model - object relationships, data skew, ownership
-3. Automation - Flow vs Apex trade-offs, trigger order, recursion
-4. Integration patterns - REST, SOAP, Platform Events, CDC, Pub/Sub, Bulk API, callouts
-5. Transaction boundaries - DML, callout restrictions, savepoints
-6. Security and sharing - CRUD, FLS, sharing rules, Apex sharing mode
-7. Scalability - behaviour at 1K, 10K, 100K+ records; concurrency; locking
-8. Governor limit exposure - use retrieved evidence for exact values, never hard-code
-9. Failure handling - transient vs permanent failures, retry, idempotency, dead-letter
-10. Observability - logging, monitoring, alerting
-11. Deployment - packaging, dependencies, release strategy
-12. Maintainability - complexity, testability, documentation
+Do not start from "which Salesforce feature solves this?"
+
+Sequence (scale depth to the question; use the full sequence when designing a
+business capability such as detect / decide / show / evolve):
+
+1. Business capability — one sentence for the outcome, not a product.
+2. Challenge the requirement — taxonomy vs a binary flag; multiple concurrent
+   outcomes; what "wrong" costs (miss vs false alarm).
+3. Separate detection from decision — probabilistic signals in, deterministic
+   policy out. Do not let an LLM be the business decision.
+4. Input boundary — which fields/history now, and how that evolves.
+5. Rules vs Einstein vs generative vs Data Cloud vs hybrid — only after data,
+   labelled history, licensing, and error-cost are named. Keep product facts
+   in retrieved evidence.
+6. Domain model — fields on the record vs a related record for lifecycle/audit.
+7. Explainability — the user must see why, not only a badge.
+8. Human-in-the-loop and override for ambiguous or high-severity outcomes.
+9. UX as its own problem — impossible to miss, without alarming every record.
+10. Scope boundary — identification vs downstream playbook/routing.
+11. Well-Architected — Trusted (including Reliable / risk), Easy (Intentional),
+    Adaptable (the taxonomy and inputs will change).
+12. ADR — options, criteria, decision or explicitly deferred pending discovery.
+
+Trusted - the solution protects the business, users, and data:
+- Secure: access control, data protection, session and org security
+- Compliant: legal, ethical, and accessibility requirements
+- Reliable: availability, performance, risk severity, and customer impact
+
+Easy - the solution delivers business value fast:
+- Intentional: requirements fit, trade-offs, documented decisions
+- Automated: Flow vs Apex, efficiency, data integrity
+- Engaging: streamlined, helpful user experience and adoption
+
+Adaptable - the solution evolves with the business:
+- Resilient: application lifecycle, incident response, continuity
+- Composable: separation of concerns, interoperability, packageability
+
+Use Architecture Center Decision Guides and Integration Patterns when the
+question is a tool or pattern choice. Keep product documentation for exact
+limits, APIs, and feature behaviour.
+
+Implementation probes (use retrieved evidence; never hard-code limit values):
+- Data model: relationships, skew, ownership
+- Automation: trigger order, recursion, Flow vs Apex
+- Integration: REST, SOAP, Platform Events, CDC, Pub/Sub, Bulk API, callouts, MCP
+- Transaction boundaries: DML, callout restrictions, savepoints
+- Governor limits, locking, and partial-failure / idempotency design
+- Observability and deployment / packaging
 
 For high-volume data scenarios always consider:
 - Bulk API 2.0 vs REST API loops
@@ -337,10 +558,11 @@ For high-volume data scenarios always consider:
 
 For each significant finding:
   Finding: <issue>
+  Pillar: Trusted | Easy | Adaptable
   Severity: Critical | High | Medium | Low | Recommendation
   Impact: <consequence>
   Evidence: <documented fact or [Inference]>
-    Recommendation: <action>
+  Recommendation: <action>
 """
 
 # ---------------------------------------------------------------------------
@@ -420,7 +642,10 @@ If all factual claims are supported by the evidence, output only:
 Rules:
 - Only flag Salesforce-specific factual claims (API names, limits, feature behaviour,
   release information, product capabilities).
-- Do not flag general architectural reasoning or [Inference] labels.
+- Do not flag general architectural reasoning or [Inference] labels unless they
+  assert a Well-Architected pillar or capability that is not in the evidence.
+- Flag Well-Architected claims (Trusted, Easy, Adaptable, or named capabilities)
+  when they are presented as Salesforce framework guidance and are not in the evidence.
 - Do not flag claims the user themselves stated in their question.
 - Treat a claim as supported when the evidence clearly states it or entails it by
   paraphrase; do not require verbatim wording.

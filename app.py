@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+from contextvars import ContextVar
 import requests
 import tiktoken
 from dotenv import load_dotenv
@@ -12,6 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
+from providers import get_llm
 from prompts import (
     INTENT_CLASSIFIER_PROMPT,
     QUERY_PLANNER_PROMPT,
@@ -25,7 +27,12 @@ from prompts import (
     CODE_REVIEW_PROMPT,
     GROUNDING_CHECK_PROMPT,
     GROUNDING_REWRITE_PROMPT,
+    EVIDENCE_CRITIC_PROMPT,
+    SOLUTION_ARCHITECT_PROMPT,
+    SOLUTION_ARCHITECTURE_PROTOCOL,
+    SOLUTION_ARCHITECTURE_PROTOCOL_SHORT,
 )
+import solution_architect as sa
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -41,6 +48,15 @@ logger.add("logs/app.log", rotation="10 MB", retention="7 days", level="DEBUG")
 MCP_URL        = os.getenv("MCP_URL",        "https://salesforce-docs-76258744c9d7.herokuapp.com/api/mcp")
 MCP_TIMEOUT    = int(os.getenv("MCP_TIMEOUT",    "30"))
 MCP_MAX_TOKENS = int(os.getenv("MCP_MAX_TOKENS", "1500"))
+# For intents where truncating an authoritative value (a limit number, a version,
+# a definition) is worse than a wider context window, retrieval widens the excerpt
+# cap. Scoped per-retrieval via a ContextVar so it never bloats unrelated packs.
+MCP_MAX_TOKENS_GENEROUS = int(os.getenv("MCP_MAX_TOKENS_GENEROUS", str(MCP_MAX_TOKENS * 2)))
+_MCP_TOKEN_BUDGET: ContextVar[int] = ContextVar("mcp_token_budget", default=MCP_MAX_TOKENS)
+
+
+def _effective_mcp_max_tokens() -> int:
+    return _MCP_TOKEN_BUDGET.get()
 GROQ_MODEL     = os.getenv("GROQ_MODEL",     "openai/gpt-oss-20b")
 OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL",   "qwen2.5-coder:7b")
 OLLAMA_MODEL_FAST = os.getenv("OLLAMA_MODEL_FAST", "gemma3:1b")
@@ -54,8 +70,26 @@ DEBUG_FULL_EXCERPTS = os.getenv("DEBUG_FULL_EXCERPTS", "false").lower() in {"1",
 
 SEARCH_BUDGET  = {"quick": 1, "standard": 2, "deep": 3}
 FETCH_BUDGET   = {"quick": 0, "standard": 1, "deep": 1}
+ARCHITECTURE_SEARCH_BUDGET = 4
+ARCHITECTURE_RESCUE_BUDGET = 2
+ARCHITECTURE_SECOND_PASS_BUDGET = 2
+ARCHITECTURE_FETCH_BUDGET = 2
 # Definition questions always fetch the top doc regardless of depth tier.
 FETCH_BUDGET_DEFINITION = 1
+# Court-order (release notes) + statute (current guide); cheatsheet is a digest.
+SEASONAL_SEARCH_BUDGET = 4
+SEASONAL_FETCH_BUDGET = 2
+_GENERIC_RELEASE_NOTES_QUERIES = {
+    "salesforce release notes current release",
+}
+_ATLAS_DOC_URL_RE = re.compile(
+    r"https://developer\.salesforce\.com/docs/atlas\.en-us\.[^/\s\]]+\.meta/([^/\s\]]+)/([^\s\)\]]+)",
+    re.IGNORECASE,
+)
+_MARKDOWN_DOC_LINK_RE = re.compile(
+    r"\[([^\]]+)\]\((https://developer\.salesforce\.com/docs/[^)]+)\)",
+    re.IGNORECASE,
+)
 MCP_FAILURE_CACHE_SECONDS = int(os.getenv("MCP_FAILURE_CACHE_SECONDS", "60"))
 
 # ---------------------------------------------------------------------------
@@ -180,8 +214,25 @@ def _call_mcp(tool_name: str, arguments: dict) -> tuple[str, bool]:
         return "", False
 
 
-def _parse_mcp_document_payload(raw: str) -> dict:
-    parsed = {
+def _chunk_document_identity(chunk: dict) -> tuple[str, str, str]:
+    meta = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+    path = str(
+        chunk.get("documentPath")
+        or chunk.get("document_path")
+        or meta.get("documentPath")
+        or meta.get("document_path")
+        or ""
+    ).strip()
+    url = str(chunk.get("url") or chunk.get("link") or meta.get("url") or "").strip()
+    title = str(
+        chunk.get("title") or chunk.get("name") or meta.get("title") or path or ""
+    ).strip()
+    return path, url, title
+
+
+def _parse_mcp_search_documents(raw: str) -> list[dict]:
+    """One evidence item per document path. Search chunks often mix docs."""
+    fallback = {
         "title": "",
         "url": "",
         "document_path": "",
@@ -190,32 +241,66 @@ def _parse_mcp_document_payload(raw: str) -> dict:
     try:
         data = json.loads(raw)
     except Exception:
-        return parsed
+        return [fallback] if str(raw or "").strip() else []
 
     if not isinstance(data, dict):
-        return parsed
+        return [fallback] if str(raw or "").strip() else []
 
     chunks = data.get("chunks")
     if not isinstance(chunks, list) or not chunks:
-        return parsed
+        return [fallback] if str(raw or "").strip() else []
 
-    contents = []
-    first_chunk = chunks[0] if isinstance(chunks[0], dict) else {}
+    grouped: dict[str, dict] = {}
+    order: list[str] = []
     for chunk in chunks:
-        if isinstance(chunk, dict):
-            content = chunk.get("content")
-            if content:
-                contents.append(str(content))
+        if not isinstance(chunk, dict):
+            continue
+        path, url, title = _chunk_document_identity(chunk)
+        key = path or url or title or f"chunk-{len(grouped)}"
+        if key not in grouped:
+            grouped[key] = {
+                "title": title,
+                "url": url,
+                "document_path": path,
+                "contents": [],
+            }
+            order.append(key)
+        rec = grouped[key]
+        if title and not rec["title"]:
+            rec["title"] = title
+        if url and not rec["url"]:
+            rec["url"] = url
+        if path and not rec["document_path"]:
+            rec["document_path"] = path
+        content = chunk.get("content")
+        if content:
+            rec["contents"].append(str(content))
 
-    parsed["excerpt"] = _smart_truncate("\n\n".join(contents) if contents else raw, MCP_MAX_TOKENS)
-    parsed["document_path"] = (
-        str(first_chunk.get("documentPath") or first_chunk.get("document_path") or "").strip()
-    )
-    parsed["title"] = (
-        str(first_chunk.get("title") or first_chunk.get("name") or parsed["document_path"] or "").strip()
-    )
-    parsed["url"] = str(first_chunk.get("url") or first_chunk.get("link") or "").strip()
-    return parsed
+    docs = []
+    for key in order:
+        rec = grouped[key]
+        excerpt = _smart_truncate("\n\n".join(rec["contents"]) if rec["contents"] else raw, _effective_mcp_max_tokens())
+        if not excerpt.strip():
+            continue
+        docs.append(
+            {
+                "title": rec["title"] or rec["document_path"],
+                "url": rec["url"],
+                "document_path": rec["document_path"],
+                "excerpt": excerpt,
+            }
+        )
+    return docs or [fallback]
+
+
+def _parse_mcp_document_payload(raw: str) -> dict:
+    docs = _parse_mcp_search_documents(raw)
+    return docs[0] if docs else {
+        "title": "",
+        "url": "",
+        "document_path": "",
+        "excerpt": raw,
+    }
 
 
 def _parse_mcp_fetch_payload(raw: str) -> dict:
@@ -229,7 +314,7 @@ def _parse_mcp_fetch_payload(raw: str) -> dict:
         return _parse_mcp_document_payload(raw)
     content = data.get("content")
     if content:
-        parsed["excerpt"] = _smart_truncate(str(content), MCP_MAX_TOKENS)
+        parsed["excerpt"] = _smart_truncate(str(content), _effective_mcp_max_tokens())
         parsed["document_path"] = str(data.get("documentPath") or data.get("id") or "").strip()
         parsed["url"] = str(data.get("url") or "").strip()
         parsed["title"] = parsed["document_path"]
@@ -259,6 +344,8 @@ def _prompt_kind(system_prompt: str) -> str:
         return "temporal"
     if QUERY_PLANNER_PROMPT in system_prompt:
         return "query"
+    if SOLUTION_ARCHITECT_PROMPT in system_prompt:
+        return "solution"
     if EVIDENCE_CONFLICT_RESOLUTION_PROMPT in system_prompt:
         return "conflict"
     if GROUNDING_CHECK_PROMPT in system_prompt:
@@ -275,14 +362,31 @@ def _safe_fallback_content(kind: str, human_prompt: str) -> str:
         return json.dumps(_determine_temporal_context(human_prompt, {}))
     if kind == "query":
         return "[]"
+    if kind == "solution":
+        return json.dumps(
+            {
+                "business_capability": "",
+                "objects": [],
+                "capabilities": [],
+                "technical_requirements": [],
+                "search_queries": [],
+                "avoid_products": [],
+                "separate_detection_from_policy": False,
+                "discovery_questions": [],
+            }
+        )
     if kind == "conflict":
         return json.dumps({
             "status": "no_conflict",
             "applicable_fact": None,
             "conflicts": [],
         })
+    if kind == "critic":
+        return json.dumps({"aligned": True, "reason": None, "rescue_queries": []})
     if kind == "grounding":
-        return "GROUNDING: passed"
+        # Fail closed: if the grounding checker is unavailable we must NOT pass
+        # the answer as verified. This sentinel maps to an unverified status.
+        return "GROUNDING: unverified"
     if kind == "grounding_rewrite":
         return (
             "## Answer\n"
@@ -418,12 +522,228 @@ def _temporal_search_boosters(message: str, temporal: dict) -> list[str]:
     return boosters
 
 
+def _needs_seasonal_authority(
+    message: str,
+    intent_data: dict | None = None,
+    temporal: dict | None = None,
+) -> bool:
+    """True when standing docs can lag a Salesforce seasonal release."""
+    temporal = temporal or {}
+    if temporal.get("historical_release_requested") or temporal.get("current_docs_required"):
+        return True
+    if _is_volatile_limit_question(message):
+        return True
+    intent = str((intent_data or {}).get("intent") or "")
+    return intent in {"limits", "release"}
+
+
+def _is_release_notes_evidence(item: dict) -> bool:
+    """Identity of the document, not a passing mention in a digest body."""
+    if _is_non_authoritative_salesforce_evidence(item):
+        return False
+    metadata = _authority_metadata_blob(item)
+    return bool(
+        re.search(
+            r"release[-_\s]?notes|\brn_[a-z]|salesforce_release_notes",
+            metadata,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _is_limits_cheatsheet(item: dict) -> bool:
+    blob = _evidence_blob(item)
+    return "cheatsheet" in blob or "salesforce_app_limits" in blob
+
+
+def _is_generic_release_notes_query(query: str) -> bool:
+    return str(query or "").strip().lower() in _GENERIC_RELEASE_NOTES_QUERIES
+
+
+def _merge_temporal_queries(
+    queries: list[str],
+    message: str,
+    intent_data: dict,
+    temporal: dict,
+    max_q: int,
+) -> list[str]:
+    """Court order first, then the question, then the standing statute.
+
+    Do not spend the whole search budget on a generic release-notes hub query.
+    The hub is the index; the ruling is the topic-specific note. Cheatsheets
+    are a digest and are not a search target of their own.
+    """
+    if not _needs_seasonal_authority(message, intent_data, temporal):
+        return queries[:max_q]
+    boosters = _temporal_search_boosters(message, temporal)
+    merged: list[str] = []
+
+    def _add(query: str) -> None:
+        text = str(query or "").strip()
+        if text and text not in merged:
+            merged.append(text)
+
+    topic_rn = [
+        booster
+        for booster in boosters
+        if "release note" in booster.lower() and not _is_generic_release_notes_query(booster)
+    ]
+    generic_rn = [booster for booster in boosters if _is_generic_release_notes_query(booster)]
+    statute = [
+        booster
+        for booster in boosters
+        if "release note" not in booster.lower()
+    ]
+    if not topic_rn:
+        compact = " ".join(
+            word
+            for word in re.findall(r"[A-Za-z0-9']+", message)
+            if word.lower() not in {"what", "whats", "the", "is", "a", "an"}
+        ).strip()
+        topic_rn = [f"Salesforce {compact or message} release notes"]
+
+    for booster in topic_rn[:1]:
+        _add(booster)
+    for query in queries:
+        if _is_generic_release_notes_query(query):
+            continue
+        if "release note" in query.lower():
+            continue
+        _add(query)
+    for booster in statute:
+        _add(booster)
+    for booster in topic_rn[1:]:
+        _add(booster)
+    for booster in generic_rn:
+        _add(booster)
+    return merged[:max_q]
+
+
+def _requires_court_order(message: str, intent_data: dict | None = None) -> bool:
+    if _is_volatile_limit_question(message):
+        return True
+    return str((intent_data or {}).get("intent") or "") in {"limits", "release"}
+
+
+def _court_order_covers_question(item: dict, message: str) -> bool:
+    """True when release notes actually rule on this question, not just the hub."""
+    if not _is_release_notes_evidence(item):
+        return False
+    blob = _evidence_blob(item)
+    matches = list(_VOLATILE_LIMIT_PATTERNS.finditer(message))
+    if matches:
+        for match in matches:
+            token = match.group(0).lower()
+            if token in blob:
+                return True
+            head = token.split()[0]
+            if len(head) >= 4 and head in blob:
+                return True
+        return False
+    terms = _topic_terms(message, {"intent": "release"})
+    return any(term in blob for term in terms if len(term) >= 4)
+
+
+def _statute_on_topic(item: dict, message: str) -> bool:
+    """True when a standing guide is about this limit/feature, not a TOC or changelog."""
+    meta = _authority_metadata_blob(item)
+    matches = list(_VOLATILE_LIMIT_PATTERNS.finditer(message))
+    if matches:
+        for match in matches:
+            token = match.group(0).lower()
+            head = token.split()[0]
+            if token in meta or (len(head) >= 4 and head in meta):
+                return True
+        lower = message.lower()
+        if any(key in lower for key in ("heap", "governor", "soql", "dml", "cpu", "callout")):
+            if "governor" in meta and "limit" in meta:
+                return True
+            if "gov_limits" in meta:
+                return True
+        return False
+    terms = _topic_terms(message, {"intent": "release"})
+    return any(term in meta for term in terms if len(term) >= 4)
+
+
+def _is_standing_statute(item: dict) -> bool:
+    """Current developer/help guide — the law, not the seasonal ruling or a digest."""
+    if _is_limits_cheatsheet(item) or _is_release_notes_evidence(item):
+        return False
+    return _is_authoritative_salesforce_evidence(item)
+
+
+def _seasonal_authority_rank(item: dict, message: str) -> int:
+    if _court_order_covers_question(item, message):
+        return 4
+    if _is_standing_statute(item) and _statute_on_topic(item, message):
+        return 3
+    if _is_standing_statute(item):
+        return 2
+    if _is_release_notes_evidence(item):
+        return 1
+    return 0
+
+
+def _mcp_path_from_atlas_url(url: str) -> str | None:
+    match = _ATLAS_DOC_URL_RE.search(url or "")
+    if not match:
+        return None
+    bundle, page = match.group(1), match.group(2)
+    page = page.split("?")[0].split("#")[0].rstrip(".,;")
+    if "cheatsheet" in bundle.lower() or "cheatsheet" in page.lower():
+        return None
+    if page.endswith(".htm"):
+        page = page[:-4] + ".html"
+    elif not page.endswith(".html"):
+        page = f"{page}.html"
+    return f"{bundle}/{page}"
+
+
+def _cited_standing_guides(excerpt: str) -> list[dict]:
+    """Follow digest citations to the standing guide (citator, not a product list)."""
+    found: list[dict] = []
+    seen: set[str] = set()
+    for title, url in _MARKDOWN_DOC_LINK_RE.findall(excerpt or ""):
+        if "cheatsheet" in url.lower() or "release-notes" in url.lower():
+            continue
+        key = url.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(
+            {
+                "title": title.strip(),
+                "url": url.strip(),
+                "document_path": _mcp_path_from_atlas_url(url),
+            }
+        )
+    if not found:
+        for match in _ATLAS_DOC_URL_RE.finditer(excerpt or ""):
+            url = match.group(0)
+            path = _mcp_path_from_atlas_url(url)
+            if not path or url.lower() in seen:
+                continue
+            seen.add(url.lower())
+            found.append({"title": "", "url": url, "document_path": path})
+    return found
+
+
 def validate_temporal_context(message: str, intent_data: dict, llm) -> dict:
     fallback = _determine_temporal_context(message, intent_data)
     definition_question = _is_definition_question(message, intent_data)
     lower = message.lower()
     explicit_current_scope = "current" in lower or "latest" in lower
     historical_release = _find_historical_release(message)
+    if llm is None:
+        merged = dict(fallback)
+        merged["reason"] = "heuristic"
+        if definition_question and not explicit_current_scope and not historical_release:
+            merged["temporal_validation_required"] = False
+            merged["current_docs_required"] = False
+        if _is_volatile_limit_question(message) and not historical_release:
+            merged["temporal_validation_required"] = True
+            merged["current_docs_required"] = True
+        return merged
     try:
         resp = _invoke_resilient(llm, [
             SystemMessage(content=TEMPORAL_FACT_VALIDATION_PROMPT),
@@ -466,24 +786,34 @@ def validate_temporal_context(message: str, intent_data: dict, llm) -> dict:
         return fallback
 
 
-def mcp_search(query: str) -> dict:
+def _format_search_hit(query: str, parsed: dict) -> dict:
+    return {
+        "query": query,
+        "excerpt": parsed.get("excerpt") or "",
+        "source_type": "Salesforce Documentation",
+        "authority": "Salesforce Documentation",
+        "is_authoritative": True,
+        "title": parsed.get("title") or "",
+        "url": parsed.get("url") or "",
+        "document_path": parsed.get("document_path") or "",
+        "relevance": None,
+    }
+
+
+def mcp_search(query: str) -> dict | list[dict]:
     logger.info(f"Search | query='{query}'")
     raw, ok = _call_mcp("salesforce_docs_search", {"query": query, "limit": 3})
     if not ok or not raw:
         logger.warning(f"Search empty | query='{query}'")
         return {}
-    parsed = _parse_mcp_document_payload(raw)
-    return {
-        "query": query,
-        "excerpt": parsed["excerpt"],
-        "source_type": "Salesforce Documentation",
-        "authority": "Salesforce Documentation",
-        "is_authoritative": True,
-        "title": parsed["title"],
-        "url": parsed["url"],
-        "document_path": parsed["document_path"],
-        "relevance": None,
-    }
+    hits = [
+        _format_search_hit(query, parsed)
+        for parsed in _parse_mcp_search_documents(raw)
+        if parsed.get("excerpt")
+    ]
+    if not hits:
+        return {}
+    return hits if len(hits) > 1 else hits[0]
 
 
 def _google_available() -> bool:
@@ -501,6 +831,7 @@ def _is_official_salesforce_url(url: str | None) -> bool:
             "help.salesforce.com",
             "salesforce.com/docs",
             "docs.salesforce.com",
+            "architect.salesforce.com",
         )
     )
 
@@ -568,71 +899,85 @@ def mcp_fetch(document_path: str) -> dict:
     }
 
 # ---------------------------------------------------------------------------
-# Provider / Model Selection
+# Provider / Model Selection — see providers.py
 # ---------------------------------------------------------------------------
 
-def _ollama_available() -> bool:
-    try:
-        requests.get(OLLAMA_URL, timeout=2)
-        return True
-    except Exception:
+
+_PROTECTED_INTENTS = {"troubleshooting", "code_review", "limits", "release"}
+
+
+def _looks_like_design_question(message: str) -> bool:
+    """True for how-to, implement, and architecture questions."""
+    if _is_volatile_limit_question(message):
         return False
+    return sa.is_solution_question(message)
 
 
-def _make_groq(model: str = None):
-    from langchain_groq import ChatGroq
-    return ChatGroq(
-        model=model or GROQ_MODEL,
-        groq_api_key=os.environ["GROQ_API_KEY"],
-        temperature=0,
-        max_tokens=2048,
+def _apply_troubleshooting_intent(message: str, parsed: dict) -> dict:
+    """Bug reports and component repros are diagnosis, not architecture."""
+    if parsed.get("intent") in {"limits", "release"}:
+        return parsed
+    if not sa.is_troubleshooting_question(message):
+        return parsed
+    parsed["intent"] = "troubleshooting"
+    parsed["question_type"] = "diagnosis"
+    parsed["requires_architecture_analysis"] = False
+    parsed["requires_code_analysis"] = True
+    parsed["requires_documentation"] = True
+    if parsed.get("research_depth") in (None, "quick"):
+        parsed["research_depth"] = "standard"
+    if parsed.get("model_tier") in (None, "fast"):
+        parsed["model_tier"] = "standard"
+    return parsed
+
+
+def _apply_design_intent(message: str, parsed: dict) -> dict:
+    """Upgrade research/fact classifications when the question is a design problem."""
+    if parsed.get("intent") in _PROTECTED_INTENTS:
+        return parsed
+    if sa.is_troubleshooting_question(message):
+        return parsed
+    if not _looks_like_design_question(message):
+        return parsed
+    parsed["intent"] = "architecture"
+    parsed["question_type"] = "design"
+    parsed["requires_architecture_analysis"] = True
+    parsed["requires_multiple_sources"] = True
+    parsed["research_depth"] = "deep"
+    parsed["model_tier"] = "reasoning"
+    parsed["requires_documentation"] = True
+    return parsed
+
+
+def classify_intent_heuristic(message: str) -> dict:
+    """Rules-based intent when no LLM is configured. Prefers recall over precision."""
+    parsed = dict(_SAFE_FALLBACK_INTENT)
+    lower = message.lower().strip()
+    parsed["is_salesforce_specific"] = True
+    parsed["requires_documentation"] = True
+    if _is_volatile_limit_question(message) or (
+        "api version" in lower and any(token in lower for token in ("latest", "current", "what"))
+    ):
+        parsed["intent"] = "limits" if _is_volatile_limit_question(message) else "release"
+        parsed["question_type"] = "current_fact"
+        parsed["requires_current_docs"] = True
+        parsed["temporal_validation_required"] = True
+        parsed["research_depth"] = "quick"
+        parsed["model_tier"] = "fast"
+    elif sa.is_definition_shaped(message) and not _looks_like_design_question(message):
+        parsed["intent"] = "quick_fact"
+        parsed["question_type"] = "explanation"
+        parsed["research_depth"] = "quick"
+        parsed["model_tier"] = "fast"
+    parsed = _apply_troubleshooting_intent(message, parsed)
+    parsed = _apply_design_intent(message, parsed)
+    temporal = _determine_temporal_context(message, parsed)
+    parsed["temporal_validation_required"] = temporal["temporal_validation_required"]
+    parsed["requested_release"] = temporal["requested_release"]
+    parsed["requires_current_docs"] = bool(
+        parsed.get("requires_current_docs") or temporal["current_docs_required"]
     )
-
-
-def _make_ollama(model: str = None):
-    from langchain_ollama import ChatOllama
-    return ChatOllama(model=model or OLLAMA_MODEL, temperature=0)
-
-
-# MCP tool risk levels (per OpenAI agent guide — tools should be rated by risk).
-# All MCP tools here are READ-ONLY (no writes, no side effects) → LOW risk.
-# If write tools are added in future, rate them MEDIUM or HIGH and add confirmation.
-MCP_TOOL_RISK = {
-    "salesforce_docs_search": "low",   # read-only semantic search
-    "salesforce_docs_fetch":  "low",   # read-only document fetch
-}
-
-
-def get_llm(tier: str = "standard") -> tuple[str, object]:
-    """
-    Return (label, llm) for the requested tier.
-    Priority: Groq first (capable), Ollama as fallback (local).
-    Tiers: fast | standard | reasoning
-    """
-    has_groq = bool(os.environ.get("GROQ_API_KEY"))
-    ollama_up = _ollama_available()
-
-    # Groq first for all tiers — it follows prompt instructions correctly.
-    # Ollama is fallback only (local models too small for conditional format rules).
-    if has_groq:
-        try:
-            llm = _make_groq()
-            logger.info(f"ModelTier={tier} | Provider=Groq | Model={GROQ_MODEL}")
-            return f"Groq/{GROQ_MODEL}", llm
-        except Exception as e:
-            logger.warning(f"Groq init failed: {e}")
-
-    if ollama_up:
-        model = OLLAMA_MODEL_FAST if tier == "fast" else OLLAMA_MODEL
-        try:
-            llm = _make_ollama(model)
-            logger.info(f"ModelTier={tier} | Provider=Ollama | Model={model}")
-            return f"Ollama/{model}", llm
-        except Exception as e:
-            logger.warning(f"Ollama init failed: {e}")
-
-    logger.error("All providers unavailable")
-    return None, None
+    return parsed
 
 # ---------------------------------------------------------------------------
 # Input Guardrail
@@ -655,7 +1000,8 @@ _SALESFORCE_SIGNALS = re.compile(
     r"change data capture|bulk api|governor limit|org|sandbox|scratch org|metadata|"  
     r"deployment|permission set|profile|object|field|trigger|batch|queueable|"  
     r"future method|named credential|external credential|data cloud|tableau|mulesoft|"  
-    r"heroku|slack|einstein|omni.?channel|service cloud|sales cloud|experience cloud)\b",
+    r"heroku|slack|einstein|omni.?channel|service cloud|sales cloud|experience cloud|"
+    r"well-?architected|architecture center|decision guide)\b",
     re.IGNORECASE,
 )
 
@@ -721,6 +1067,13 @@ _SAFE_FALLBACK_INTENT = {
 
 
 def classify_intent(message: str, llm) -> dict:
+    if llm is None:
+        parsed = classify_intent_heuristic(message)
+        logger.info(
+            f"Intent=heuristic | Intent={parsed.get('intent')} | "
+            f"ResearchDepth={parsed.get('research_depth')}"
+        )
+        return parsed
     try:
         resp = _invoke_resilient(llm, [
             SystemMessage(content=INTENT_CLASSIFIER_PROMPT),
@@ -735,7 +1088,10 @@ def classify_intent(message: str, llm) -> dict:
             maybe = _extract_json_payload(raw)
             if isinstance(maybe, dict) and maybe.get("unable_to_classify"):
                 logger.warning("IntentClassifier=unable_to_classify | using safe fallback")
-                return _SAFE_FALLBACK_INTENT
+                return _apply_design_intent(
+                    message,
+                    _apply_troubleshooting_intent(message, dict(_SAFE_FALLBACK_INTENT)),
+                )
         except Exception:
             pass
 
@@ -756,6 +1112,9 @@ def classify_intent(message: str, llm) -> dict:
             parsed["temporal_validation_required"] = True
             parsed["requires_current_docs"] = False
 
+        parsed = _apply_troubleshooting_intent(message, parsed)
+        parsed = _apply_design_intent(message, parsed)
+
         logger.info(
             f"Intent={parsed.get('intent')} | "
             f"QuestionType={parsed.get('question_type')} | "
@@ -770,28 +1129,383 @@ def classify_intent(message: str, llm) -> dict:
         return parsed
     except json.JSONDecodeError as e:
         logger.warning(f"Intent classifier invalid JSON: {e} — using safe fallback")
-        return _SAFE_FALLBACK_INTENT
+        return _apply_design_intent(
+            message,
+            _apply_troubleshooting_intent(message, dict(_SAFE_FALLBACK_INTENT)),
+        )
     except Exception as e:
         logger.warning(f"Intent classification failed: {e} — using safe fallback")
-        return _SAFE_FALLBACK_INTENT
+        return _apply_design_intent(
+            message,
+            _apply_troubleshooting_intent(message, dict(_SAFE_FALLBACK_INTENT)),
+        )
 
 # ---------------------------------------------------------------------------
 # Search Query Planning
 # ---------------------------------------------------------------------------
 
-def build_search_queries(message: str, intent_data: dict, llm, temporal_context: dict | None = None) -> list[str]:
+def _is_architecture_question(intent_data: dict) -> bool:
+    intent = str(intent_data.get("intent") or "").lower()
+    return intent == "architecture" or bool(intent_data.get("requires_architecture_analysis"))
+
+
+_SUBJECT_RE = re.compile(
+    r"`([^`]+)`"
+    r"|\"([A-Za-z][\w.-]+)\""
+    r"|(\b[A-Za-z]\w*\.[A-Za-z]\w*)"
+    r"|(\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+)"
+    r"|(\b[A-Z][a-zA-Z0-9]*(?:[A-Z][a-zA-Z0-9]+)+)"
+    r"|(\b[A-Za-z]\w+__[a-zA-Z]\b)"
+)
+_CONTRACT_EVIDENCE_RE = re.compile(
+    r"\b(methods?|properties|property|attributes?|events?|annotation|"
+    r"parameter|signature|interface|governor)\b",
+    re.IGNORECASE,
+)
+_QUERY_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "from", "when", "after",
+    "same", "back", "into", "does", "not", "there", "way", "fix", "example",
+    "steps", "reproduce", "enter", "however", "please", "would", "like",
+    "what", "your", "could", "should", "then", "than", "have", "been",
+    "actual", "expected", "behavior", "behaviour",
+}
+_MAX_QUERY_CHARS = 140
+
+
+def _is_diagnosis(message: str, intent_data: dict | None = None) -> bool:
+    intent = str((intent_data or {}).get("intent") or "")
+    return intent == "troubleshooting" or sa.is_troubleshooting_question(message)
+
+
+def _named_subjects(message: str) -> list[str]:
+    """Identifiers the user named — syntax, not a product catalog."""
+    found: list[str] = []
+    for match in _SUBJECT_RE.finditer(message):
+        name = next((part for part in match.groups() if part), "").strip()
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+def _symptom_tokens(message: str, subjects: list[str] | None = None) -> list[str]:
+    skip = set(_QUERY_STOPWORDS)
+    for subject in subjects or _named_subjects(message):
+        skip.add(subject.lower())
+        skip.update(re.findall(r"[a-z0-9]+", subject.lower()))
+    words: list[str] = []
+    for word in re.findall(r"[a-z0-9-]{3,}", message.lower()):
+        if word in skip or word in words:
+            continue
+        words.append(word)
+        if len(words) >= 6:
+            break
+    return words
+
+
+def _token_in_blob(token: str, blob: str) -> bool:
+    return bool(re.search(rf"\b{re.escape(token)}\b", blob))
+
+
+def _has_diagnosis_coverage(message: str, evidence: list[dict]) -> bool:
+    blob = " ".join(_evidence_blob(item) for item in evidence).lower()
+    if _CONTRACT_EVIDENCE_RE.search(blob):
+        return True
+    tokens = _symptom_tokens(message)
+    if not tokens:
+        return True
+    hits = sum(1 for token in tokens if _token_in_blob(token, blob))
+    return hits >= min(2, len(tokens))
+
+
+def _ensure_named_subject_queries(
+    result: list[str], message: str, intent_data: dict
+) -> list[str]:
+    """Guarantee the user's named subjects survive query planning.
+
+    A factual named-subject question ("how do I read clientChatQueuePosition?")
+    or a diagnosis must retrieve against the literal identifier the user named.
+    The LLM planner can paraphrase it away (topic drift); re-insert any named
+    subject not already present so retrieval stays anchored to what was named.
+    Scoped to fact-lookup/diagnosis so it never crowds out design queries on
+    genuine architecture questions.
+    """
+    if not (sa.is_fact_lookup(message) or _is_diagnosis(message, intent_data)):
+        return result
+    subjects = _named_subjects(message)
+    if not subjects:
+        return result
+    lowered = " ".join(result).lower()
+    missing = [s for s in subjects if s.lower() not in lowered]
+    if not missing:
+        return result
+    # Front-load so the named subject survives the later max_q trim.
+    return missing + result
+
+
+def _compress_query(message: str) -> str:
+    first = re.split(r"[.\n]", message.strip())[0].strip()
+    if len(first) <= _MAX_QUERY_CHARS:
+        return first or message[:_MAX_QUERY_CHARS]
+    return " ".join(first.split()[:16])
+
+
+def _compact_search_queries(message: str, intent_data: dict) -> list[str]:
+    """Official-docs queries. Never send a multi-paragraph repro as query #1."""
+    subjects = _named_subjects(message)
+    if not subjects and _is_diagnosis(message, intent_data):
+        subjects = [_compress_query(message)]
+    if subjects and _is_diagnosis(message, intent_data):
+        queries: list[str] = []
+        for name in subjects[:2]:
+            if name not in queries:
+                queries.append(name)
+            reference = f"{name} Salesforce reference"
+            if reference not in queries:
+                queries.append(reference)
+            tail = " ".join(_symptom_tokens(message, [name])[:4])
+            if tail:
+                combined = f"{name} {tail}"
+                if combined not in queries:
+                    queries.append(combined)
+        return queries
+    if subjects:
+        return subjects[:2]
+    if len(message) > _MAX_QUERY_CHARS:
+        return [_compress_query(message)]
+    return [message]
+
+
+def _is_architecture_center_evidence(item: dict) -> bool:
+    blob = _evidence_blob(item)
+    if "architect.salesforce.com" in blob:
+        return True
+    path = str(item.get("document_path") or "").lower()
+    return (
+        "well-architected" in path
+        or "/docs/architect/" in path
+        or path.startswith("architect/")
+        or "decision-guides" in path
+        or "decision_guides" in path
+    )
+
+
+def _architecture_search_boosters(message: str, intent_data: dict) -> list[str]:
+    if not _is_architecture_question(intent_data):
+        return []
+    boosters = ["Salesforce Well-Architected Framework Trusted Easy Adaptable"]
+    haystack = " ".join(
+        [
+            message,
+            " ".join(str(part) for part in (intent_data.get("topics") or [])),
+            " ".join(str(part) for part in (intent_data.get("salesforce_features") or [])),
+        ]
+    ).lower()
+    integrationish = any(
+        token in haystack
+        for token in (
+            "integrat",
+            "mcp",
+            " api",
+            "apis",
+            "platform event",
+            "cdc",
+            "change data",
+            "erp",
+            "mulesoft",
+            "pubsub",
+            "pub/sub",
+            "callout",
+            "sync",
+            "bulk",
+            "ldv",
+        )
+    )
+    if integrationish:
+        boosters.append("Salesforce Architecture Center integration patterns")
+    else:
+        boosters.append("Salesforce Architecture Center decision guides")
+    return boosters
+
+
+def translate_requirement(message: str, intent_data: dict, llm=None) -> dict:
+    """Business requirement → Salesforce technical search plan."""
+    if not _is_architecture_question(intent_data) and not sa.is_solution_question(message):
+        return dict(sa.EMPTY_PLAN)
+    plan = sa.heuristic_plan(message)
+    if not plan.get("active"):
+        if _is_architecture_question(intent_data):
+            plan = dict(sa.EMPTY_PLAN)
+            plan["active"] = True
+            plan["skip_raw"] = sa.is_business_requirement(message)
+        return plan
+    if (
+        llm is None
+        or not plan.get("skip_raw")
+        or not callable(getattr(llm, "invoke", None))
+    ):
+        return plan
+    try:
+        resp = _invoke_resilient(
+            llm,
+            [
+                SystemMessage(content=SOLUTION_ARCHITECT_PROMPT),
+                HumanMessage(content=message),
+            ],
+            "solution",
+            message,
+        )
+        payload = _extract_json_payload(resp.content)
+        if isinstance(payload, dict):
+            return sa.merge_llm_plan(plan, payload)
+    except Exception as exc:
+        logger.warning(f"SolutionArchitect=llm_failed | {exc}")
+    return plan
+
+
+def _merge_architecture_queries(
+    queries: list[str],
+    intent_data: dict,
+    message: str,
+    max_q: int,
+    solution_plan: dict | None = None,
+) -> list[str]:
+    boosters = _architecture_search_boosters(message, intent_data)
+    plan = solution_plan if solution_plan is not None else {}
+    capability_queries = list(plan.get("search_queries") or [])
+    skip_raw = bool(plan.get("skip_raw") and capability_queries)
+    if not boosters and not capability_queries:
+        return queries[:max_q]
+    merged: list[str] = []
+
+    def _add(query: str) -> None:
+        text = str(query or "").strip()
+        if not text or text in merged:
+            return
+        if skip_raw and text == message.strip():
+            return
+        merged.append(text)
+
+    if skip_raw:
+        reserved = min(len(boosters), 1)
+        cap_budget = max(1, max_q - reserved)
+        for query in capability_queries[:cap_budget]:
+            _add(query)
+        if queries:
+            _add(queries[0])
+        for booster in boosters:
+            _add(booster)
+        for query in queries[1:]:
+            _add(query)
+        return merged[:max_q]
+
+    if queries:
+        _add(queries[0])
+    for booster in boosters:
+        _add(booster)
+    for query in queries[1:]:
+        _add(query)
+    for query in capability_queries:
+        _add(query)
+    return merged[:max_q]
+
+
+def _is_wrong_family_item(message: str, item: dict, solution_plan: dict | None = None) -> bool:
+    plan = solution_plan if solution_plan is not None else sa.heuristic_plan(message)
+    return sa.is_avoided_evidence(plan, item)
+
+
+def _architecture_family_gap(
+    message: str,
+    intent_data: dict,
+    evidence: list[dict],
+    solution_plan: dict | None = None,
+) -> dict:
+    plan = solution_plan if solution_plan is not None else translate_requirement(message, intent_data)
+    return sa.evidence_gap(plan, evidence)
+
+
+def _drop_wrong_family_evidence(
+    message: str,
+    evidence: list[dict],
+    solution_plan: dict | None = None,
+) -> list[dict]:
+    plan = solution_plan if solution_plan is not None else sa.heuristic_plan(message)
+    return sa.drop_avoided_evidence(plan, evidence)
+
+
+def _llm_architecture_rescue_queries(
+    message: str,
+    evidence: list[dict],
+    llm,
+    solution_plan: dict | None = None,
+) -> list[str]:
+    if llm is None or not callable(getattr(llm, "invoke", None)) or not evidence:
+        return []
+    titles = []
+    for item in evidence[:6]:
+        title = item.get("title") or item.get("authority") or "Salesforce source"
+        url = item.get("url") or ""
+        titles.append(f"- {title} {url}".strip())
+    plan = solution_plan or {}
+    prompt = (
+        f"question={json.dumps(message)}\n"
+        f"technical_requirements={json.dumps(plan.get('technical_requirements') or [])}\n"
+        f"objects={json.dumps(plan.get('objects') or [])}\n"
+        f"evidence:\n" + "\n".join(titles)
+    )
+    try:
+        resp = _invoke_resilient(
+            llm,
+            [
+                SystemMessage(content=EVIDENCE_CRITIC_PROMPT),
+                HumanMessage(content=prompt),
+            ],
+            "critic",
+            message,
+        )
+        payload = _extract_json_payload(resp.content)
+        if not isinstance(payload, dict) or payload.get("aligned", True):
+            return []
+        queries = payload.get("rescue_queries") or []
+        cleaned: list[str] = []
+        for query in queries:
+            text = str(query or "").strip()
+            if len(text) < 8 or text == message.strip():
+                continue
+            cleaned.append(text)
+        return cleaned[:ARCHITECTURE_RESCUE_BUDGET]
+    except Exception as exc:
+        logger.warning(f"ArchitectureCritic=llm_failed | {exc}")
+        return []
+
+
+def build_search_queries(
+    message: str,
+    intent_data: dict,
+    llm,
+    temporal_context: dict | None = None,
+    solution_plan: dict | None = None,
+) -> list[str]:
     depth = intent_data.get("research_depth", "standard")
     max_q = SEARCH_BUDGET.get(depth, 2)
+    if _is_architecture_question(intent_data):
+        max_q = max(max_q, ARCHITECTURE_SEARCH_BUDGET)
+    if _is_diagnosis(message, intent_data):
+        max_q = max(max_q, 3)
     features = intent_data.get("salesforce_features", [])
     temporal = temporal_context or _determine_temporal_context(message, intent_data)
+    if _needs_seasonal_authority(message, intent_data, temporal):
+        max_q = max(max_q, SEASONAL_SEARCH_BUDGET)
     boosters = _temporal_search_boosters(message, temporal)
     definition_intent = _is_definition_question(message, intent_data)
     definition_boosters = _definition_search_boosters(message, intent_data) if definition_intent else []
+    plan = solution_plan if solution_plan is not None else translate_requirement(message, intent_data, llm)
 
     logger.debug(
         f"QueryPlan | definition_intent={definition_intent} | "
         f"core_concept={_extract_core_concept(message) if definition_intent else None} | "
-        f"boosters={definition_boosters} | temporal={temporal}"
+        f"boosters={boosters} | temporal={temporal} | "
+        f"sa_skip_raw={plan.get('skip_raw')} | sa_caps={plan.get('capabilities')}"
     )
 
     if definition_intent:
@@ -805,6 +1519,24 @@ def build_search_queries(message: str, intent_data: dict, llm, temporal_context:
             if booster not in result:
                 result.insert(0, booster)
         result = result[:max_q]
+        result = _merge_architecture_queries(result, intent_data, message, max_q, plan)
+        result = _merge_temporal_queries(result, message, intent_data, temporal, max_q)
+        logger.info(f"Planned queries: {result}")
+        return result
+
+    if llm is None:
+        if plan.get("skip_raw") and plan.get("search_queries"):
+            result = list(plan["search_queries"])
+        else:
+            result = _compact_search_queries(message, intent_data)
+        if not result:
+            result = [message]
+        if len(result) < max_q:
+            for booster in boosters:
+                if booster not in result:
+                    result.append(booster)
+        result = _merge_architecture_queries(result, intent_data, message, max_q, plan)
+        result = _merge_temporal_queries(result, message, intent_data, temporal, max_q)
         logger.info(f"Planned queries: {result}")
         return result
 
@@ -813,6 +1545,8 @@ def build_search_queries(message: str, intent_data: dict, llm, temporal_context:
             f"question={json.dumps(message)}, "
             f"intent={json.dumps(intent_data.get('intent'))}, "
             f"features={json.dumps(features)}, "
+            f"technical_requirements={json.dumps(plan.get('technical_requirements') or [])}, "
+            f"capability_queries={json.dumps(plan.get('search_queries') or [])}, "
             f"temporal={json.dumps(temporal)}, "
             f"boosters={json.dumps(boosters)}, "
             f"max_queries={max_q}"
@@ -836,13 +1570,22 @@ def build_search_queries(message: str, intent_data: dict, llm, temporal_context:
                 for query in _definition_query_variants(core, intent_data):
                     if query not in result:
                         result.insert(0, query)
+            result = _ensure_named_subject_queries(result, message, intent_data)
             result = result[:max_q]
+            result = _merge_architecture_queries(result, intent_data, message, max_q, plan)
+            result = _merge_temporal_queries(result, message, intent_data, temporal, max_q)
             logger.info(f"Planned queries: {result}")
             return result
     except Exception as e:
         logger.warning(f"Query planning failed: {e} — using message as query")
 
-    return [message]
+    return _merge_temporal_queries(
+        _merge_architecture_queries([message], intent_data, message, max_q, plan),
+        message,
+        intent_data,
+        temporal,
+        max_q,
+    )
 
 
 def _extract_core_concept(message: str) -> str:
@@ -946,7 +1689,7 @@ def _is_sufficient(evidence: list[dict], intent_data: dict, require_authoritativ
     return len(non_empty) >= 2  # deep needs at least 2
 
 
-def _topic_terms(message: str, intent_data: dict) -> set[str]:
+def _topic_terms(message: str, intent_data: dict, solution_plan: dict | None = None) -> set[str]:
     stopwords = {
         "salesforce",
         "documentation",
@@ -967,12 +1710,26 @@ def _topic_terms(message: str, intent_data: dict) -> set[str]:
         "question",
         "query",
         "asper",
+        # Generic function words: no topical signal, must not become match terms.
+        "the", "and", "for", "with", "from", "that", "this", "about", "how",
+        "why", "when", "where", "which", "who", "does", "did", "can", "will",
+        "you", "our", "get", "want", "need", "there", "into", "using", "use",
+        "have", "has", "had", "are", "was", "were", "any", "all", "its",
+        "their", "them", "then", "than", "give", "tell", "show", "find",
     }
     terms: set[str] = set()
     sources = []
     sources.extend(intent_data.get("topics", []) or [])
     sources.extend(intent_data.get("salesforce_features", []) or [])
-    sources.append(message)
+    if solution_plan and solution_plan.get("skip_raw"):
+        sources.extend(solution_plan.get("objects") or [])
+        sources.extend(solution_plan.get("search_queries") or [])
+        sources.extend(solution_plan.get("technical_requirements") or [])
+    elif _is_diagnosis(message, intent_data):
+        sources.extend(_named_subjects(message) or [_compress_query(message)])
+        sources.extend(_compact_search_queries(message, intent_data))
+    else:
+        sources.append(message)
     for source in sources:
         for word in re.findall(r"[a-zA-Z]{3,}", str(source).lower()):
             if word not in stopwords:
@@ -980,7 +1737,19 @@ def _topic_terms(message: str, intent_data: dict) -> set[str]:
     return terms
 
 
-def _is_relevant(item: dict, terms: set[str], min_matches: int = 2) -> bool:
+def _is_relevant(
+    item: dict,
+    terms: set[str],
+    min_matches: int = 2,
+    intent_data: dict | None = None,
+    solution_plan: dict | None = None,
+) -> bool:
+    if intent_data and _is_architecture_question(intent_data) and _is_architecture_center_evidence(item):
+        return True
+    if solution_plan and sa.has_capability_evidence(solution_plan, [item]):
+        return True
+    if solution_plan and sa.is_avoided_evidence(solution_plan, item):
+        return False
     if not terms:
         return True
     blob = _evidence_blob(item)
@@ -989,10 +1758,37 @@ def _is_relevant(item: dict, terms: set[str], min_matches: int = 2) -> bool:
     return matches >= min_matches
 
 
-def _filter_relevant_evidence(evidence: list[dict], terms: set[str]) -> list[dict]:
+def _filter_relevant_evidence(
+    evidence: list[dict],
+    terms: set[str],
+    intent_data: dict | None = None,
+    solution_plan: dict | None = None,
+    message: str = "",
+) -> list[dict]:
     if not terms:
         return evidence
-    return [item for item in evidence if _is_relevant(item, terms)]
+    filtered = [
+        item
+        for item in evidence
+        if _is_relevant(item, terms, intent_data=intent_data, solution_plan=solution_plan)
+    ]
+    if intent_data and _is_architecture_question(intent_data):
+        for item in evidence:
+            if _is_architecture_center_evidence(item) and item not in filtered:
+                filtered.append(item)
+    if message and intent_data and _requires_court_order(message, intent_data):
+        for item in evidence:
+            if item in filtered:
+                continue
+            if (
+                _court_order_covers_question(item, message)
+                or (_is_standing_statute(item) and _statute_on_topic(item, message))
+                or _is_limits_cheatsheet(item)
+            ):
+                filtered.append(item)
+    if solution_plan:
+        sa.drop_avoided_evidence(solution_plan, filtered)
+    return filtered
 
 
 def _build_unverified_relevance_response(message: str, evidence: list[dict]) -> str:
@@ -1009,6 +1805,92 @@ def _build_unverified_relevance_response(message: str, evidence: list[dict]) -> 
         "## Note\n"
         "The retrieved evidence was not relevant enough to support a grounded Salesforce answer.\n\n"
         "## Sources\n"
+        f"{source_block}"
+    )
+
+
+# Function words + generic doc noise that carry no topical signal. Deliberately
+# NOT plan-derived: this gate must be an INDEPENDENT check of evidence vs. the
+# literal question, so it cannot inherit a drifted plan's vocabulary.
+_QUESTION_STOPWORDS = {
+    "salesforce", "documentation", "docs", "doc", "the", "and", "for", "with",
+    "from", "that", "this", "about", "how", "what", "whats", "why", "when",
+    "where", "which", "who", "does", "did", "can", "could", "should", "would",
+    "will", "your", "you", "our", "get", "getting", "got", "please", "want",
+    "need", "there", "into", "using", "use", "used", "have", "has", "had",
+    "are", "was", "were", "any", "all", "its", "their", "them", "then", "than",
+    "latest", "current", "please", "give", "tell", "show", "find", "make",
+    "set", "let", "via", "onto", "off",
+}
+
+
+def _question_content_terms(message: str) -> set[str]:
+    """Topical terms from the LITERAL question, independent of any plan."""
+    terms: set[str] = set()
+    for word in re.findall(r"[a-z0-9]{3,}", str(message or "").lower()):
+        if word in _QUESTION_STOPWORDS:
+            continue
+        terms.add(word)
+    return terms
+
+
+def _term_prefix_in_blob(term: str, blob: str) -> bool:
+    # Prefix match so "event" covers "events", "queue" covers "queues", etc.
+    return bool(re.search(rf"\b{re.escape(term)}", blob))
+
+
+def _evidence_covers_question(message: str, evidence: list[dict]) -> bool:
+    """Does any retrieved item actually cover the question's topical terms?
+
+    Independent of the relevance filter (which derives terms from the plan and so
+    cannot catch planner drift). Requires the best-matching item to cover a
+    scaled fraction of the question's content terms.
+    """
+    terms = _question_content_terms(message)
+    if len(terms) < 2:
+        return True  # too few terms to judge — do not block
+    threshold = max(2, (len(terms) + 1) // 2)
+    best = 0
+    for item in evidence:
+        blob = _evidence_blob(item)
+        matched = sum(1 for term in terms if _term_prefix_in_blob(term, blob))
+        if matched > best:
+            best = matched
+    return best >= threshold
+
+
+def _pack_is_off_topic(message: str, intent_data: dict, evidence: list[dict]) -> bool:
+    """True when retrieved evidence does not answer the literal question.
+
+    Skips genuine architecture/design questions (conceptual docs legitimately
+    have low lexical overlap) UNLESS the question is a factual named-subject
+    lookup — those must always be answered on-topic, even if a classifier
+    misrouted them to architecture.
+    """
+    if not evidence:
+        return False  # empty-pack is handled by the no-evidence paths
+    architecture = _is_architecture_question(intent_data)
+    if architecture and not sa.is_fact_lookup(message):
+        return False
+    return not _evidence_covers_question(message, evidence)
+
+
+def _build_off_topic_pack_response(message: str, evidence: list[dict]) -> str:
+    """Retrieval-only response when the pack does not match the question."""
+    source_lines = []
+    for item in _sort_evidence_by_trust(evidence):
+        title = item.get("title") or item.get("authority") or "Salesforce source"
+        url = item.get("url") or ""
+        source_lines.append(f"- {title}{(' — ' + url) if url else ''}")
+    source_block = "\n".join(source_lines) if source_lines else "- Nothing retrieved."
+    return (
+        "## No on-topic documentation found\n"
+        "[Unverified] The retrieved Salesforce documentation does not appear to "
+        f"answer this question: \"{message.strip()}\". Do not treat the sources "
+        "below as an answer — they were retrieved but did not match the topic.\n\n"
+        "Try naming the exact API, object, or feature (for example the specific "
+        "class, method, field, or product name) so retrieval can target it.\n\n"
+        "## Retrieved (unmatched) sources\n"
         f"{source_block}"
     )
 
@@ -1063,6 +1945,7 @@ def _evidence_sufficiency_stage(
     message: str,
     topic_terms: set[str],
     require_authoritative: bool = False,
+    solution_plan: dict | None = None,
 ) -> dict:
     """Canonical sufficiency gate for retrieval.
 
@@ -1071,7 +1954,15 @@ def _evidence_sufficiency_stage(
     """
     non_empty = [item for item in evidence if item.get("excerpt")]
     definition_intent = _is_definition_question(message, intent_data)
-    topic_match = not topic_terms or any(_is_relevant(item, topic_terms) for item in non_empty)
+    topic_match = not topic_terms or any(
+        _is_relevant(
+            item,
+            topic_terms,
+            intent_data=intent_data,
+            solution_plan=solution_plan,
+        )
+        for item in non_empty
+    )
     definition_satisfied = True
 
     if require_authoritative and not _has_authoritative_salesforce_source(non_empty):
@@ -1100,6 +1991,17 @@ def _evidence_sufficiency_stage(
         reason = "topic_mismatch"
     elif definition_intent and not definition_satisfied:
         reason = "definition_not_satisfied"
+    elif sufficient and _is_diagnosis(message, intent_data) and not _has_diagnosis_coverage(message, non_empty):
+        sufficient = False
+        reason = "diagnosis_uncovered"
+    elif sufficient and _requires_court_order(message, intent_data):
+        if not any(_court_order_covers_question(item, message) for item in non_empty):
+            sufficient = False
+            reason = (
+                "release_notes_missing"
+                if not any(_is_release_notes_evidence(item) for item in non_empty)
+                else "release_notes_off_topic"
+            )
 
     return {
         "sufficient": sufficient,
@@ -1121,6 +2023,26 @@ def _merge_unique_evidence(existing: list[dict], new_items: list[dict]) -> None:
 
 def _sort_evidence_for_intent(evidence: list[dict], intent_data: dict, message: str) -> list[dict]:
     base = _sort_evidence_by_trust(evidence)
+    if _is_architecture_question(intent_data):
+        return sorted(
+            base,
+            key=lambda item: (
+                1 if _is_architecture_center_evidence(item) else 0,
+                _source_trust_score(item),
+                len(_metadata_hints(item)),
+            ),
+            reverse=True,
+        )
+    if _requires_court_order(message, intent_data):
+        return sorted(
+            base,
+            key=lambda item: (
+                _seasonal_authority_rank(item, message),
+                _source_trust_score(item),
+                len(_metadata_hints(item)),
+            ),
+            reverse=True,
+        )
     if not _is_definition_question(message, intent_data):
         return base
     return sorted(
@@ -1134,7 +2056,76 @@ def _sort_evidence_for_intent(evidence: list[dict], intent_data: dict, message: 
     )
 
 
-def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: dict = None) -> list[dict]:
+def _search_hits(result) -> list[dict]:
+    if not result:
+        return []
+    if isinstance(result, list):
+        return [item for item in result if item]
+    return [result]
+
+
+def _run_retrieval_query(query: str, evidence: list[dict], *, log_label: str = "Search") -> None:
+    logger.info(f"{log_label} | query='{query}'")
+    hits = _search_hits(mcp_search(query))
+    if hits:
+        _merge_unique_evidence(evidence, hits)
+    if GOOGLE_SEARCH_MODE in {"hybrid", "always"} and _google_available():
+        google_hits = google_search(query)
+        if google_hits:
+            logger.info(
+                f"GoogleSearchSupplement | query='{query}' | hits={len(google_hits)}"
+            )
+            _merge_unique_evidence(evidence, google_hits)
+
+
+def _use_generous_truncation(intent_data: dict, message: str, temporal: dict) -> bool:
+    """Widen the excerpt cap when a truncated value would corrupt the answer.
+
+    Limits/release/current-fact answers hinge on a specific number or version, and
+    a definition needs the whole conceptual statement — truncating those mid-value
+    is a fluent-but-wrong risk the north star forbids. Everything else keeps the
+    default cap so ordinary packs stay lean.
+    """
+    return bool(
+        _is_current_fact_request(intent_data, temporal)
+        or temporal.get("historical_release_requested")
+        or intent_data.get("intent") in {"release", "limits"}
+        or _is_definition_question(message, intent_data)
+    )
+
+
+def retrieve_evidence(
+    message: str,
+    intent_data: dict,
+    llm,
+    temporal_context: dict = None,
+    solution_plan: dict | None = None,
+) -> list[dict]:
+    """Deterministic bounded retrieval with an intent-scoped excerpt-truncation cap.
+
+    Thin wrapper: resolves temporal context once, widens the MCP excerpt budget for
+    value-bearing intents (see `_use_generous_truncation`), and always resets it so
+    the wider cap never leaks into a later retrieval on the same context.
+    """
+    if not intent_data.get("requires_documentation"):
+        logger.info("DocumentationRequired=false — skipping retrieval")
+        return []
+    temporal = temporal_context or validate_temporal_context(message, intent_data, llm)
+    budget = MCP_MAX_TOKENS_GENEROUS if _use_generous_truncation(intent_data, message, temporal) else MCP_MAX_TOKENS
+    token = _MCP_TOKEN_BUDGET.set(budget)
+    try:
+        return _retrieve_evidence_impl(message, intent_data, llm, temporal, solution_plan)
+    finally:
+        _MCP_TOKEN_BUDGET.reset(token)
+
+
+def _retrieve_evidence_impl(
+    message: str,
+    intent_data: dict,
+    llm,
+    temporal_context: dict = None,
+    solution_plan: dict | None = None,
+) -> list[dict]:
     """
     Deterministic bounded retrieval.
     Gate: requires_documentation (not requires_current_docs).
@@ -1155,6 +2146,14 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
     )
     if _is_definition_question(message, intent_data):
         search_budget = max(search_budget, 4)
+    if _is_architecture_question(intent_data):
+        search_budget = max(search_budget, ARCHITECTURE_SEARCH_BUDGET)
+        fetch_budget = max(fetch_budget, ARCHITECTURE_FETCH_BUDGET)
+    if _is_diagnosis(message, intent_data):
+        search_budget = max(search_budget, 3)
+    if _needs_seasonal_authority(message, intent_data, temporal):
+        search_budget = max(search_budget, SEASONAL_SEARCH_BUDGET)
+        fetch_budget = max(fetch_budget, SEASONAL_FETCH_BUDGET)
     if require_temporal_depth:
         depth = "standard" if depth == "quick" else depth
         search_budget = max(search_budget, SEARCH_BUDGET["standard"])
@@ -1166,27 +2165,32 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
     require_authoritative = _is_current_fact_request(intent_data, temporal)
 
     evidence: list[dict] = []
+    plan = solution_plan if solution_plan is not None else translate_requirement(
+        message, intent_data, llm
+    )
 
     # Build focused queries
-    queries = build_search_queries(message, intent_data, llm, temporal)
-    topic_terms = _topic_terms(message, intent_data)
+    try:
+        queries = build_search_queries(
+            message, intent_data, llm, temporal, solution_plan=plan
+        )
+    except TypeError:
+        queries = build_search_queries(message, intent_data, llm, temporal)
+    topic_terms = _topic_terms(message, intent_data, plan)
 
     logger.info(f"SearchBudget={search_budget} | Queries={len(queries)}")
+    searched_queries: list[str] = []
+
+    def _already_searched(query: str) -> bool:
+        return query.strip().lower() in {item.strip().lower() for item in searched_queries}
+
+    def _search(query: str, log_label: str = "Search") -> None:
+        searched_queries.append(query)
+        _run_retrieval_query(query, evidence, log_label=log_label)
 
     # Execute searches within budget
     for i, query in enumerate(queries[:search_budget], 1):
-        logger.info(f"Search #{i} | query='{query}'")
-        result = mcp_search(query)
-        if result:
-            evidence.append(result)
-
-        if GOOGLE_SEARCH_MODE in {"hybrid", "always"} and _google_available():
-            google_hits = google_search(query)
-            if google_hits:
-                logger.info(
-                    f"GoogleSearchSupplement | query='{query}' | hits={len(google_hits)}"
-                )
-                _merge_unique_evidence(evidence, google_hits)
+        _search(query, log_label=f"Search #{i}")
 
         sufficiency = _evidence_sufficiency_stage(
             evidence,
@@ -1194,15 +2198,25 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
             message,
             topic_terms,
             require_authoritative=require_authoritative,
+            solution_plan=plan,
         )
+        family_gap = _architecture_family_gap(message, intent_data, evidence, plan)
         if sufficiency["sufficient"]:
-            logger.info(f"EvidenceSufficient=true after {i} search(es)")
-            break
+            if (
+                _is_architecture_question(intent_data)
+                and not any(_is_architecture_center_evidence(item) for item in evidence)
+            ):
+                logger.info("ArchitectureCenterMissing=continue_search")
+            elif family_gap["needs_rescue"]:
+                logger.info("ArchitectureCritic=continue_search | missing_product_family")
+            else:
+                logger.info(f"EvidenceSufficient=true after {i} search(es)")
+                break
 
     if GOOGLE_SEARCH_MODE == "fallback" and _google_available():
         needs_google = (
             not evidence
-            or not any(_is_relevant(item, topic_terms) for item in evidence)
+            or not any(_is_relevant(item, topic_terms, intent_data=intent_data) for item in evidence)
             or (require_authoritative and not _has_authoritative_salesforce_source(evidence))
         )
         if needs_google:
@@ -1214,6 +2228,42 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
             if evidence:
                 logger.info(f"GoogleFallbackEvidenceCount={len(google_hits)}")
 
+    family_gap = _architecture_family_gap(message, intent_data, evidence, plan)
+    if family_gap["needs_rescue"]:
+        rescue_queries = [
+            query
+            for query in family_gap["rescue_queries"]
+            if not _already_searched(query)
+        ][:ARCHITECTURE_RESCUE_BUDGET]
+        if rescue_queries:
+            logger.info(f"ArchitectureCritic=rescue | queries={rescue_queries}")
+            for query in rescue_queries:
+                _search(query, log_label="RescueSearch")
+        family_gap = _architecture_family_gap(message, intent_data, evidence, plan)
+        if family_gap["needs_rescue"]:
+            llm_rescue = [
+                query
+                for query in _llm_architecture_rescue_queries(message, evidence, llm, plan)
+                if not _already_searched(query)
+            ]
+            for query in llm_rescue[:ARCHITECTURE_RESCUE_BUDGET]:
+                _search(query, log_label="CriticSearch")
+
+    if (
+        _is_architecture_question(intent_data)
+        and not any(_is_architecture_center_evidence(item) for item in evidence)
+    ):
+        second_pass = [
+            query
+            for query in _architecture_search_boosters(message, intent_data)
+            if not _already_searched(query)
+        ][:ARCHITECTURE_SECOND_PASS_BUDGET]
+        if second_pass:
+            logger.info(f"ArchitectureSecondPass={second_pass}")
+            for query in second_pass:
+                _search(query, log_label="SecondPass")
+
+    evidence = _drop_wrong_family_evidence(message, evidence, plan)
     logger.info(f"EvidenceCount={len(evidence)}")
 
     # Prefer release/current-doc fetches when temporal validation is required.
@@ -1233,18 +2283,7 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
                 f"queries={rescue_queries[:rescue_budget]}"
             )
             for query in rescue_queries[:rescue_budget]:
-                logger.info(f"RescueSearch | query='{query}'")
-                result = mcp_search(query)
-                if result:
-                    evidence.append(result)
-
-                if GOOGLE_SEARCH_MODE in {"hybrid", "always"} and _google_available():
-                    google_hits = google_search(query)
-                    if google_hits:
-                        logger.info(
-                            f"GoogleSearchSupplement | rescue_query='{query}' | hits={len(google_hits)}"
-                        )
-                        _merge_unique_evidence(evidence, google_hits)
+                _search(query, log_label="RescueSearch")
 
             sufficiency = _evidence_sufficiency_stage(
                 evidence,
@@ -1252,6 +2291,7 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
                 message,
                 topic_terms,
                 require_authoritative=require_authoritative,
+                solution_plan=plan,
             )
             if sufficiency["sufficient"]:
                 logger.info("DefinitionRetrievalRetry=resolved")
@@ -1268,12 +2308,54 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
     # Optional fetch: only spend fetch budget on a relevant result that has a real path.
     if fetch_budget > 0 and evidence:
         ranked_for_fetch = _sort_evidence_for_intent(evidence, intent_data, message)
-        fetch_source = next(
-            (item for item in ranked_for_fetch if item.get("document_path") and _is_relevant(item, topic_terms)),
-            None,
-        )
-        if fetch_source:
+        to_fetch: list[dict] = []
+        if _is_architecture_question(intent_data):
+            architect_fetch = next(
+                (
+                    item
+                    for item in ranked_for_fetch
+                    if item.get("document_path") and _is_architecture_center_evidence(item)
+                ),
+                None,
+            )
+            if architect_fetch:
+                to_fetch.append(architect_fetch)
+            for item in ranked_for_fetch:
+                if len(to_fetch) >= fetch_budget:
+                    break
+                if item in to_fetch or not item.get("document_path"):
+                    continue
+                if _is_wrong_family_item(message, item, plan):
+                    continue
+                to_fetch.append(item)
+        else:
+            if _requires_court_order(message, intent_data):
+                ranked_for_fetch = sorted(
+                    ranked_for_fetch,
+                    key=lambda item: (
+                        _seasonal_authority_rank(item, message),
+                        _source_trust_score(item),
+                    ),
+                    reverse=True,
+                )
+            for item in ranked_for_fetch:
+                if len(to_fetch) >= fetch_budget:
+                    break
+                if item in to_fetch or not item.get("document_path"):
+                    continue
+                if not _is_relevant(item, topic_terms, intent_data=intent_data):
+                    if not (
+                        _requires_court_order(message, intent_data)
+                        and _is_standing_statute(item)
+                    ):
+                        continue
+                to_fetch.append(item)
+        seen_paths: set[str] = set()
+        for fetch_source in to_fetch:
             doc_path = fetch_source.get("document_path")
+            if not doc_path or doc_path in seen_paths:
+                continue
+            seen_paths.add(doc_path)
             logger.debug(
                 f"FetchSelection | title={fetch_source.get('title')} | "
                 f"path={doc_path} | url={fetch_source.get('url')} | "
@@ -1283,6 +2365,21 @@ def retrieve_evidence(message: str, intent_data: dict, llm, temporal_context: di
             fetched = mcp_fetch(doc_path)
             if fetched:
                 evidence.append(fetched)
+                if _requires_court_order(message, intent_data) and _is_limits_cheatsheet(fetched):
+                    for citation in _cited_standing_guides(fetched.get("excerpt") or ""):
+                        cite_path = citation.get("document_path")
+                        if not cite_path or cite_path in seen_paths:
+                            continue
+                        logger.info(f"StatuteCitation=follow | path='{cite_path}' | from='{doc_path}'")
+                        cited = mcp_fetch(cite_path)
+                        if cited:
+                            seen_paths.add(cite_path)
+                            evidence.append(cited)
+                            break
+                        title = citation.get("title") or ""
+                        if title and not _already_searched(title):
+                            _search(title, log_label="StatuteCitationSearch")
+                            break
 
     return evidence
 
@@ -1314,6 +2411,7 @@ SALESFORCE_OFFICIAL_URL_MARKERS = (
     "salesforce.com/docs",
     "docs.salesforce.com",
     "salesforce.com/documentation",
+    "architect.salesforce.com",
 )
 
 
@@ -1406,6 +2504,10 @@ def _source_trust_score(item: dict) -> int:
         return 10
     if any(marker in metadata_blob for marker in NON_AUTHORITATIVE_METADATA_MARKERS):
         return 10
+    if _is_release_notes_evidence(item):
+        return 140 if item.get("is_authoritative") else 125
+    if _is_limits_cheatsheet(item):
+        return 80 if item.get("is_authoritative") else 70
     if any(marker in blob for marker in SALESFORCE_AUTHORITATIVE_MARKERS):
         return 110 if item.get("is_authoritative") else 100
     if any(marker in blob for marker in SALESFORCE_OFFICIAL_URL_MARKERS):
@@ -1468,7 +2570,7 @@ def _format_evidence_summary(evidence: list[dict]) -> str:
 
 
 def resolve_evidence_conflicts(evidence: list[dict], intent_data: dict, llm, message: str) -> dict:
-    if len(evidence) < 2:
+    if llm is None or len(evidence) < 2:
         return {
             "status": "no_conflict",
             "applicable_fact": None,
@@ -1507,7 +2609,12 @@ def resolve_evidence_conflicts(evidence: list[dict], intent_data: dict, llm, mes
 # System Prompt Composition
 # ---------------------------------------------------------------------------
 
-def build_synthesis_prompt(message: str, intent_data: dict, current_fact_verified: bool = False) -> str:
+def build_synthesis_prompt(
+    message: str,
+    intent_data: dict,
+    current_fact_verified: bool = False,
+    solution_plan: dict | None = None,
+) -> str:
     parts = [RESEARCH_SYNTHESIS_PROMPT]
     if current_fact_verified:
         parts.append(CURRENT_FACT_DIRECT_ANSWER_PROMPT)
@@ -1517,6 +2624,11 @@ def build_synthesis_prompt(message: str, intent_data: dict, current_fact_verifie
 
     if intent == "architecture" or intent_data.get("requires_architecture_analysis"):
         parts.append(ARCHITECTURE_REASONING_PROMPT)
+        plan = solution_plan if solution_plan is not None else sa.heuristic_plan(message)
+        if plan.get("full_protocol"):
+            parts.append(SOLUTION_ARCHITECTURE_PROTOCOL)
+        elif sa.is_solution_question(message):
+            parts.append(SOLUTION_ARCHITECTURE_PROTOCOL_SHORT)
 
     if intent in ("code_review", "troubleshooting") or intent_data.get("requires_code_analysis"):
         parts.append(CODE_REVIEW_PROMPT)
@@ -1549,13 +2661,27 @@ def _get_thread_id(history: list) -> str:
     return _SESSION_THREADS[key]
 
 
-def generate_answer(message: str, evidence: list[dict], intent_data: dict, conflict_summary: dict, temporal_context: dict, llm, thread_id: str = "default") -> str:
+def generate_answer(
+    message: str,
+    evidence: list[dict],
+    intent_data: dict,
+    conflict_summary: dict,
+    temporal_context: dict,
+    llm,
+    thread_id: str = "default",
+    solution_plan: dict | None = None,
+) -> str:
     synthesis_evidence = evidence
     if _is_current_fact_request(intent_data, temporal_context):
         synthesis_evidence = _filter_current_fact_evidence(evidence)
     ordered_evidence = _sort_evidence_for_intent(synthesis_evidence, intent_data, message)
     current_fact_verified = _is_current_fact_request(intent_data, temporal_context) and _has_authoritative_salesforce_source(ordered_evidence)
-    system_prompt = build_synthesis_prompt(message, intent_data, current_fact_verified=current_fact_verified)
+    system_prompt = build_synthesis_prompt(
+        message,
+        intent_data,
+        current_fact_verified=current_fact_verified,
+        solution_plan=solution_plan,
+    )
 
     if ordered_evidence:
         ev_lines = ["## Retrieved Evidence\n"]
@@ -1594,8 +2720,10 @@ def generate_answer(message: str, evidence: list[dict], intent_data: dict, confl
         f"Conflicts: {json.dumps(conflict_summary.get('conflicts', []))}\n"
         + (
             "IMPORTANT: This question asks about a governor limit or platform limit that changes "
-            "release-to-release. The retrieved documentation may reflect an older release. "
-            "If the evidence does not include release notes, explicitly note in your answer that "
+            "release-to-release. Salesforce Release Notes are the court order. The current "
+            "developer guide is the statute. Cheatsheets are a digest and can lag both. "
+            "Prefer release notes when they conflict. Prefer the current guide over a cheatsheet. "
+            "If the evidence does not include release notes, explicitly note that "
             "the user should verify the current value in the latest Salesforce Release Notes at "
             "https://help.salesforce.com/s/articleView?id=release-notes.salesforce_release_notes.htm"
             if temporal_context.get("current_docs_required") and _is_volatile_limit_question(message)
@@ -1610,6 +2738,39 @@ def generate_answer(message: str, evidence: list[dict], intent_data: dict, confl
         f"Topics: {', '.join(intent_data.get('topics', []))}\n"
         f"Features: {', '.join(intent_data.get('salesforce_features', []))}"
     )
+    plan = solution_plan or {}
+    if plan.get("business_capability") or plan.get("technical_requirements"):
+        extra = ["\n\n## Solution architect intake"]
+        if plan.get("business_capability"):
+            extra.append(f"Business capability: {plan['business_capability']}")
+        if plan.get("full_protocol"):
+            extra.append(
+                "Use the capability-first protocol. Do not pick a Salesforce product "
+                "before discovery. If discovery questions are unanswered, document "
+                "an ADR-style decision deferred."
+            )
+        if plan.get("separate_detection_from_policy"):
+            extra.append(
+                "Separate probabilistic detection (signals) from deterministic "
+                "business policy (risk/severity decision)."
+            )
+        if plan.get("in_scope"):
+            extra.append("In scope: " + "; ".join(plan["in_scope"]))
+        if plan.get("out_of_scope"):
+            extra.append("Out of scope: " + "; ".join(plan["out_of_scope"]))
+        if plan.get("discovery_questions"):
+            extra.append("Discovery questions still open:")
+            extra.extend(f"- {question}" for question in plan["discovery_questions"])
+        if plan.get("technical_requirements"):
+            extra.append("Translated technical requirements:")
+            extra.extend(f"- {req}" for req in plan["technical_requirements"])
+        extra.append(f"Objects: {', '.join(plan.get('objects') or [])}")
+        extra.append(f"Capabilities: {', '.join(plan.get('capabilities') or [])}")
+        extra.append(
+            "Do not retrieve or recommend platform-security products unless the "
+            "requirement is org/session security."
+        )
+        intent_block += "\n".join(extra)
 
     augmented = f"{message}\n\n{intent_block}\n\n{temporal_block}\n\n{evidence_block}"
 
@@ -1642,6 +2803,19 @@ def generate_answer(message: str, evidence: list[dict], intent_data: dict, confl
 # Grounding Check
 # ---------------------------------------------------------------------------
 
+_GROUNDING_UNVERIFIED_NOTE = (
+    "\n\n---\n**⚠️ Grounding unverified:** The automated grounding check could not "
+    "confirm this answer against the retrieved documentation. Treat the specifics "
+    "as [Unverified] and confirm against the linked official Salesforce sources."
+)
+
+
+def _append_grounding_unverified_note(answer: str) -> str:
+    if "Grounding unverified" in answer:
+        return answer
+    return answer + _GROUNDING_UNVERIFIED_NOTE
+
+
 def validate_grounding(answer: str, evidence: list[dict], llm, message: str = "", intent_data: dict | None = None) -> tuple[str, str]:
     """
     Lightweight grounding check.
@@ -1670,6 +2844,11 @@ def validate_grounding(answer: str, evidence: list[dict], llm, message: str = ""
         if "GROUNDING: passed" in result:
             logger.info("GroundingCheck=passed")
             return answer, "passed"
+        # Fail closed: the checker was unavailable (fallback sentinel) — do not
+        # emit the draft as verified.
+        if "GROUNDING: unverified" in result:
+            logger.warning("GroundingCheck=unverified | checker unavailable — failing closed")
+            return _append_grounding_unverified_note(answer), "unverified"
         # Parse unsupported claims and append warnings
         warnings = []
         for line in result.split("\n"):
@@ -1704,10 +2883,194 @@ def validate_grounding(answer: str, evidence: list[dict], llm, message: str = ""
                 logger.warning(f"GroundingRewrite failed: {rewrite_error}")
             warning_block = "\n\n---\n**Grounding note:** The following claims could not be verified against the retrieved documentation:\n" + "\n".join(f"- {w}" for w in warnings)
             return answer + warning_block, "flagged"
-        return answer, "passed"
+        # Unrecognized grounding output (no "passed", no UNSUPPORTED lines). A
+        # gate whose unknown case passes is not a gate — fail closed. Definitions
+        # keep their spine; everything else gets an explicit unverified note.
+        logger.warning("GroundingCheck=unrecognized_output | failing closed")
+        if definition_intent:
+            return answer, "flagged"
+        return _append_grounding_unverified_note(answer), "unverified"
     except Exception as e:
-        logger.warning(f"GroundingCheck failed: {e} — skipping")
-        return answer, "error"
+        logger.warning(f"GroundingCheck failed: {e} — failing closed")
+        return _append_grounding_unverified_note(answer), "unverified"
+
+def _public_solution_plan(plan: dict) -> dict:
+    return {
+        "objects": plan.get("objects") or [],
+        "actors": plan.get("actors") or [],
+        "capabilities": plan.get("capabilities") or [],
+        "technical_requirements": plan.get("technical_requirements") or [],
+        "avoid_platform_security": bool(plan.get("avoid_platform_security")),
+        "skip_raw": bool(plan.get("skip_raw")),
+        "full_protocol": bool(plan.get("full_protocol")),
+        "business_capability": plan.get("business_capability") or "",
+        "in_scope": plan.get("in_scope") or [],
+        "out_of_scope": plan.get("out_of_scope") or [],
+        "discovery_questions": plan.get("discovery_questions") or [],
+        "separate_detection_from_policy": bool(plan.get("separate_detection_from_policy")),
+    }
+
+
+def _host_instructions_for_plan(plan: dict) -> str:
+    host = (
+        "Synthesize an answer using only this evidence. "
+        "Label undocumented Salesforce facts [Unverified]. "
+        "Preserve source URLs. Do not invent documentation. "
+        "If intent is architecture, use Trusted / Easy / Adaptable only when those "
+        "terms appear in the evidence."
+    )
+    if not plan.get("skip_raw"):
+        return host
+    parts = [
+        "Think like a Salesforce Solution Architect. Do not start from a product.",
+        "Recommend against the translated capability layers, not the original jargon.",
+    ]
+    if plan.get("business_capability"):
+        parts.append(f"Business capability: {plan['business_capability']}")
+    if plan.get("full_protocol"):
+        parts.append(
+            "Follow the capability-first sequence: capability, taxonomy/decisions "
+            "and cost of being wrong, detection vs deterministic policy, input "
+            "boundary, then Salesforce options. Do not pick a product before "
+            "discovery. If discovery_questions are unanswered, write an ADR-style "
+            "decision deferred."
+        )
+    if plan.get("separate_detection_from_policy"):
+        parts.append(
+            "Keep probabilistic detection (signals) separate from deterministic "
+            "business policy."
+        )
+    if plan.get("discovery_questions"):
+        parts.append("Discovery questions: " + " | ".join(plan["discovery_questions"]))
+    if plan.get("technical_requirements"):
+        parts.append("Technical requirements: " + "; ".join(plan["technical_requirements"]))
+    parts.append(
+        "Do not recommend org-security products (Security Center, Shield Threat "
+        "Detection, Event Monitoring) unless the requirement is platform security. "
+        "Label undocumented implementation details [Inference] or [Unverified]. "
+        "Preserve source URLs."
+    )
+    return " ".join(parts)
+
+
+def build_evidence_pack(message: str, llm=None) -> dict:
+    """Retrieve grounded Salesforce evidence without requiring synthesis."""
+    should_continue, early_response = input_guardrail(message)
+    if not should_continue:
+        return {
+            "question": message,
+            "blocked": True,
+            "answer": early_response,
+            "intent": {},
+            "temporal": {},
+            "evidence": [],
+            "mode": "blocked",
+        }
+    intent_data = classify_intent(message, llm)
+    temporal_context = validate_temporal_context(message, intent_data, llm)
+    plan = translate_requirement(message, intent_data, llm)
+    raw_evidence = retrieve_evidence(
+        message, intent_data, llm, temporal_context, solution_plan=plan
+    )
+    evidence = normalize_evidence(raw_evidence)
+    topic_terms = _topic_terms(message, intent_data, plan)
+    relevant = _filter_relevant_evidence(
+        evidence, topic_terms, intent_data, plan, message=message
+    )
+    if relevant:
+        evidence = relevant
+    # Independent backstop: if the pack does not actually cover the question,
+    # flag it and withhold the "synthesize" directive so the host does not
+    # produce a fluent-but-wrong answer from off-topic authoritative docs.
+    off_topic = _pack_is_off_topic(message, intent_data, evidence)
+    if off_topic:
+        logger.warning(
+            "PackOffTopic=true | evidence did not cover the question topic | "
+            f"question='{message[:120]}'"
+        )
+        host = (
+            "The retrieved evidence below did NOT match the question topic. Do not "
+            "synthesize a substantive answer from it and do not fill gaps from "
+            "memory. Tell the user no on-topic official documentation was found and "
+            "suggest they name the exact API, object, or feature. Preserve source URLs."
+        )
+    else:
+        host = _host_instructions_for_plan(plan)
+    if not off_topic and _needs_seasonal_authority(message, intent_data, temporal_context):
+        host += (
+            " Seasonal facts: Salesforce ships three releases a year. Release notes "
+            "are the court order. The current developer guide is the statute. "
+            "Limits cheatsheets and older help articles are a digest and often lag. "
+            "If they conflict on a limit or newly GA feature, prefer the release notes. "
+            "If the pack has a digest without release notes, do not treat the digest "
+            "value as current — state the lag and point at the notes."
+        )
+    return {
+        "question": message,
+        "blocked": False,
+        "intent": intent_data,
+        "temporal": temporal_context,
+        "solution_plan": _public_solution_plan(plan),
+        "evidence": evidence,
+        "relevance": "off_topic" if off_topic else "on_topic",
+        "mode": "full" if llm is not None else "retrieval_only",
+        "host_instructions": host,
+    }
+
+
+def format_retrieval_only_answer(
+    message: str,
+    intent_data: dict,
+    evidence: list[dict],
+    temporal_context: dict,
+    solution_plan: dict | None = None,
+) -> str:
+    lines = [
+        "[retrieval-only] No LLM is configured on this machine. The Python agent still retrieved Salesforce documentation.",
+        "",
+        "Connect a provider with `python cli.py status`, paste a key in the UI, or ask this in Cursor so the local agent can synthesize from the pack below.",
+        "",
+        f"Intent: {intent_data.get('intent')} | depth: {intent_data.get('research_depth')} | architecture: {bool(intent_data.get('requires_architecture_analysis'))}",
+        f"Current docs required: {temporal_context.get('current_docs_required')}",
+        "",
+    ]
+    plan = solution_plan or {}
+    if plan.get("business_capability"):
+        lines.append(f"Business capability: {plan['business_capability']}")
+        lines.append("")
+    if plan.get("full_protocol") and plan.get("discovery_questions"):
+        lines.append("Discovery questions (answer these before committing to a product):")
+        for question in plan["discovery_questions"]:
+            lines.append(f"- {question}")
+        lines.append("")
+    if plan.get("in_scope"):
+        lines.append("In scope: " + "; ".join(plan["in_scope"]))
+    if plan.get("out_of_scope"):
+        lines.append("Out of scope: " + "; ".join(plan["out_of_scope"]))
+        lines.append("")
+    if plan.get("technical_requirements"):
+        lines.append("Translated technical requirements:")
+        for req in plan["technical_requirements"]:
+            lines.append(f"- {req}")
+        if plan.get("objects"):
+            lines.append(f"Objects: {', '.join(plan['objects'])}")
+        if plan.get("capabilities"):
+            lines.append(f"Capabilities: {', '.join(plan['capabilities'])}")
+        lines.append("")
+    if not evidence:
+        lines.append("No documentation was retrieved. Check MCP_URL and network access.")
+        return "\n".join(lines)
+    for index, item in enumerate(evidence, 1):
+        title = item.get("title") or item.get("authority") or "Salesforce source"
+        url = item.get("url") or ""
+        excerpt = (item.get("excerpt") or "")[:900]
+        lines.append(f"### {index}. {title}")
+        if url:
+            lines.append(url)
+        lines.append(excerpt)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
 
 # ---------------------------------------------------------------------------
 # Main Orchestrator
@@ -1739,9 +3102,38 @@ def run_agent(message: str, history: list) -> str:
     _record("guardrail", "passed")
 
     # Step 1 — get a fast LLM for classification and query planning
-    _, classifier_llm = get_llm("fast")
-    if not classifier_llm:
-        return "❌ No LLM provider available. Configure GROQ_API_KEY or start Ollama."
+    provider_label, classifier_llm = get_llm("fast")
+    retrieval_only = classifier_llm is None
+    if retrieval_only:
+        logger.warning("NoLLMConfigured | running retrieval-only Python agent")
+        intent_data = classify_intent_heuristic(message)
+        _record("classify", "heuristic", intent=intent_data.get("intent"))
+        temporal_context = validate_temporal_context(message, intent_data, None)
+        _record("temporal", "heuristic")
+        plan = translate_requirement(message, intent_data, None)
+        raw_evidence = retrieve_evidence(
+            message, intent_data, None, temporal_context, solution_plan=plan
+        )
+        evidence = normalize_evidence(raw_evidence)
+        _record("retrieve", "ok", evidence_count=len(evidence))
+        topic_terms = _topic_terms(message, intent_data, plan)
+        relevant_evidence = _filter_relevant_evidence(
+            evidence, topic_terms, intent_data, plan, message=message
+        )
+        if relevant_evidence:
+            evidence = relevant_evidence
+        if _pack_is_off_topic(message, intent_data, evidence):
+            logger.warning(
+                "PackOffTopic=true | retrieval-only pack did not match question "
+                f"topic | question={message.strip()[:120]!r}"
+            )
+            _record("relevance_filter", "off_topic")
+            logger.info(f"Trajectory | {trajectory}")
+            return _build_off_topic_pack_response(message, evidence)
+        logger.info(f"Trajectory | {trajectory}")
+        return format_retrieval_only_answer(
+            message, intent_data, evidence, temporal_context, plan
+        )
 
     # Step 2 — classify intent
     intent_data = classify_intent(message, classifier_llm)
@@ -1757,7 +3149,10 @@ def run_agent(message: str, history: list) -> str:
             temporal_required=temporal_context.get("temporal_validation_required"),
             current_docs=temporal_context.get("current_docs_required"))
 
-    raw_evidence = retrieve_evidence(message, intent_data, classifier_llm, temporal_context)
+    plan = translate_requirement(message, intent_data, classifier_llm)
+    raw_evidence = retrieve_evidence(
+        message, intent_data, classifier_llm, temporal_context, solution_plan=plan
+    )
     evidence = normalize_evidence(raw_evidence)
     for i, item in enumerate(evidence, 1):
         if DEBUG_FULL_EXCERPTS:
@@ -1774,8 +3169,10 @@ def run_agent(message: str, history: list) -> str:
             )
     _record("retrieve", "ok", evidence_count=len(evidence))
 
-    topic_terms = _topic_terms(message, intent_data)
-    relevant_evidence = _filter_relevant_evidence(evidence, topic_terms)
+    topic_terms = _topic_terms(message, intent_data, plan)
+    relevant_evidence = _filter_relevant_evidence(
+        evidence, topic_terms, intent_data, plan, message=message
+    )
     if evidence and topic_terms and not relevant_evidence:
         logger.warning("TopicRelevanceUnverified=true | no retrieved evidence matched topic terms")
         _record("relevance_filter", "no_match")
@@ -1783,6 +3180,18 @@ def run_agent(message: str, history: list) -> str:
         return _build_unverified_relevance_response(message, evidence)
     if relevant_evidence:
         evidence = relevant_evidence
+    # Independent backstop: the filter above derives terms from the (possibly
+    # drifted) plan, so it can validate off-topic evidence against itself. This
+    # check compares the pack to the LITERAL question and blocks synthesis when
+    # they do not match — catching planner/classifier drift the filter misses.
+    if _pack_is_off_topic(message, intent_data, evidence):
+        logger.warning(
+            "PackOffTopic=true | pack did not match question topic — refusing "
+            f"synthesis | question={message.strip()[:120]!r}"
+        )
+        _record("relevance_filter", "off_topic")
+        logger.info(f"Trajectory | {trajectory}")
+        return _build_off_topic_pack_response(message, evidence)
     if _is_current_fact_request(intent_data, temporal_context):
         evidence = _filter_current_fact_evidence(evidence)
     _record("relevance_filter", "ok", kept=len(evidence))
@@ -1819,7 +3228,16 @@ def run_agent(message: str, history: list) -> str:
     thread_id = _get_thread_id(history)
     logger.info(f"FinalGeneration | Provider={provider_label} | Tier={tier} | Thread={thread_id}")
     try:
-        answer = generate_answer(message, evidence, intent_data, conflict_summary, temporal_context, synthesis_llm, thread_id)
+        answer = generate_answer(
+            message,
+            evidence,
+            intent_data,
+            conflict_summary,
+            temporal_context,
+            synthesis_llm,
+            thread_id,
+            solution_plan=plan,
+        )
     except Exception as e:
         logger.exception(f"Generation failed | {e}")
         trajectory["fallback_reason"] = "generation_error"

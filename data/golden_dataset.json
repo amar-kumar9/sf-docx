@@ -49,5 +49,11 @@
       "MuleSoft Salesforce Connector release notes listed Salesforce API versions up to v47.0."
     ],
     "type": "historical_release"
+  },
+  {
+    "user_input": "How do I get the Live Agent chat queue position for a session?",
+    "reference": "No on-topic official Salesforce documentation was found for the Live Agent chat queue position. The retrieved Omni-Channel routing documentation does not answer the question, so the agent should refuse and ask for the exact API or property name rather than synthesizing a fluent-but-wrong answer.",
+    "reference_contexts": [],
+    "type": "off_topic"
   }
 ]

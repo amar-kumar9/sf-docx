@@ -157,6 +157,35 @@
     }
   },
   {
+    "name": "live_agent_queue_off_topic",
+    "match": [
+      "live agent",
+      "queue position",
+      "chat queue",
+      "clientchatqueueposition",
+      "assignment rules",
+      "omni-channel"
+    ],
+    "search": {
+      "title": "Omni-Channel Routing",
+      "excerpt": "Configure assignment rules and routing configurations to distribute work items to agents based on a capacity model and priority. Omni-Channel routes each work item to the most available and qualified agent.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/service/omni-channel/guide/omnichannel-routing.html",
+      "url": "https://help.salesforce.com/s/articleView?id=service.omnichannel_routing.htm"
+    },
+    "fetch": {
+      "title": "Omni-Channel Routing",
+      "excerpt": "Configure assignment rules and routing configurations to distribute work items to agents based on a capacity model and priority. Omni-Channel routes each work item to the most available and qualified agent.",
+      "source_type": "Salesforce Documentation",
+      "authority": "Salesforce Documentation",
+      "is_authoritative": true,
+      "document_path": "/docs/service/omni-channel/guide/omnichannel-routing.html",
+      "url": "https://help.salesforce.com/s/articleView?id=service.omnichannel_routing.htm"
+    }
+  },
+  {
     "name": "winter_20_release_notes",
     "match": [
       "what was the salesforce api version in the winter 20 release notes",

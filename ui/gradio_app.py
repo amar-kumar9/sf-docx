@@ -1,47 +1,79 @@
 import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import gradio as gr
+
 from app import run_agent
+from providers import PROVIDER_CHOICES, apply_runtime_provider, provider_status
 
 
-def set_groq_key(key: str):
-    if key and isinstance(key, str) and key.strip():
-        os.environ["GROQ_API_KEY"] = key.strip()
-        return "✅ Groq key saved."
-    return "⚠️ No key provided."
+def _status_markdown() -> str:
+    status = provider_status()
+    active = status["active"] or "none — retrieval-only"
+    lines = [
+        f"**Active LLM:** `{active}`",
+        f"**Selected:** `{status['selected']}`",
+        "",
+        "| Provider | Ready |",
+        "|---|---|",
+    ]
+    for row in status["providers"]:
+        mark = "yes" if row["available"] else "no"
+        lines.append(f"| {row['label']} | {mark} |")
+    if not status["active"]:
+        lines.append("")
+        lines.append(
+            "No model on this machine. Chat still retrieves Salesforce docs. "
+            "Paste a key below, start Ollama/LM Studio, or ask in Cursor."
+        )
+    return "\n".join(lines)
+
+
+def save_provider(provider: str, api_key: str, base_url: str, model: str) -> str:
+    apply_runtime_provider(provider or "auto", api_key or "", base_url or "", model or "")
+    return _status_markdown()
 
 
 with gr.Blocks(fill_height=True) as demo:
     with gr.Sidebar():
-        gr.Markdown("## ☁️ SFDC Architect Agent")
+        gr.Markdown("## SFDC Architect Agent")
         gr.Markdown(
-            "Salesforce Technical Architect AI — grounded in live "
-            "Salesforce documentation via MCP."
+            "Python retrieves and grounds Salesforce docs. "
+            "Synthesis uses whichever LLM this machine has."
         )
-        gr.HTML("<hr>")
-        gr.Markdown("### ⚙️ Providers")
-        groq_input = gr.Textbox(
-            label="Groq API Key",
+        status_md = gr.Markdown(_status_markdown())
+        provider = gr.Dropdown(
+            choices=list(PROVIDER_CHOICES),
+            value=os.getenv("LLM_PROVIDER", "auto"),
+            label="LLM provider",
+        )
+        api_key = gr.Textbox(
+            label="API key (optional for Ollama / LM Studio)",
             type="password",
-            placeholder="gsk_...",
+            placeholder="sk-... or gsk_...",
         )
-        gr.Markdown("_Ollama is used as fallback._")
-        status_label = gr.Label(value="Status: Ready.")
-        groq_input.change(fn=set_groq_key, inputs=[groq_input], outputs=[status_label])
-        gr.HTML("<hr>")
+        base_url = gr.Textbox(
+            label="Base URL (Ollama, LM Studio, or custom)",
+            placeholder="http://127.0.0.1:1234/v1",
+        )
+        model = gr.Textbox(
+            label="Model name (optional)",
+            placeholder="gpt-4o-mini, llama3.1, ...",
+        )
+        save_btn = gr.Button("Save provider on this machine")
+        save_btn.click(
+            fn=save_provider,
+            inputs=[provider, api_key, base_url, model],
+            outputs=[status_md],
+        )
         gr.Markdown(
-            "**Pipeline per turn:**\n"
-            "1. Classify intent + entities\n"
-            "2. Validate temporal scope\n"
-            "3. Plan search queries\n"
-            "4. Retrieve evidence (bounded)\n"
-            "5. Normalize evidence\n"
-            "6. Resolve evidence conflicts\n"
-            "7. Generate answer (tier-routed)\n"
-            "8. Grounding check\n\n"
-            "**Model tiers:**\n"
-            "- Fast — facts, definitions\n"
-            "- Standard — comparisons, research\n"
-            "- Reasoning — architecture, complex code"
+            "Keys are written to a local `.env` (not committed). "
+            "`auto` uses the first ready cloud key, then Ollama, then LM Studio."
         )
 
     gr.ChatInterface(
@@ -56,6 +88,7 @@ with gr.Blocks(fill_height=True) as demo:
             "Why am I getting Too many SOQL queries?",
         ],
     )
+
 
 if __name__ == "__main__":
     demo.launch(theme=gr.themes.Soft())
