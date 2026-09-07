@@ -84,8 +84,20 @@ TYPE_THRESHOLDS: dict[str, float] = {
     "explanation": 0.32,
     "design": 0.35,
     "comparison": 0.34,
+    "off_topic": 0.0,
     "default": 0.30,
 }
+
+
+def _looks_like_refusal(response: str) -> bool:
+    """True when the response refuses to answer from an off-topic/thin pack."""
+    lowered = _normalize_text(response)
+    return (
+        "no on-topic documentation" in lowered
+        or "[unverified]" in lowered
+        or "did not appear to answer" in lowered
+        or "could not find retrieved evidence" in lowered
+    )
 
 RUBRIC_NAMES = (
     "final_response_quality",
@@ -322,6 +334,19 @@ def _score_rubrics(sample: dict[str, Any], result: dict[str, Any], failures: lis
     trajectory_failures = _trajectory_failures(trace)
     schema_failures = _schema_failures(result)
 
+    # An off-topic pack is scored on the refusal contract, not coverage/grounding:
+    # a correct refusal is high quality; a fluent answer from off-topic docs is the
+    # failure. Early refusal is a valid terminal path, so trajectory is not scored.
+    if sample_type == "off_topic":
+        refused = _looks_like_refusal(response)
+        score = 5 if refused and not schema_failures else 1
+        rubric_scores = {name: score for name in RUBRIC_NAMES}
+        return {
+            "rubric_scores": rubric_scores,
+            "rubric_average": round(sum(rubric_scores.values()) / (5.0 * len(rubric_scores)), 4),
+            "rubric_pass": bool(refused and not schema_failures),
+        }
+
     evidence_count = len(evidence)
     required_doc_case = sample_type in {"current_fact", "historical_release", "explanation", "design", "comparison"}
     unverified = "[Unverified]" in response
@@ -395,8 +420,45 @@ def _session_threshold(sample_type: str) -> float:
     return TYPE_THRESHOLDS.get(str(sample_type or "default").strip().lower(), TYPE_THRESHOLDS["default"])
 
 
+def _grade_off_topic(sample: dict[str, Any], response: str, evidence: list[dict[str, Any]], trace: dict[str, Any], grounding_status: str) -> tuple[bool, list[str], dict[str, Any]]:
+    """Grade an off-topic pack: the correct behavior is to refuse, not synthesize.
+
+    Coverage, grounding, authoritative-source, and full-trajectory checks do not
+    apply — refusing early IS the north-star outcome. Pass iff the response is an
+    explicit refusal/unverified note; fail if it fluently answers from the
+    off-topic docs (the drift regression). Structural schema integrity still holds.
+    """
+    trace_steps = _trajectory_from_steps(trace.get("steps", []))
+    schema_failures = _schema_failures({
+        "response": response,
+        "trace": trace,
+        "evidence": evidence,
+        "grounding_status": grounding_status,
+    })
+    failures: list[str] = []
+    if not _looks_like_refusal(response):
+        failures.append("off_topic_not_refused")
+    if schema_failures:
+        failures.extend(f"schema:{failure}" for failure in schema_failures)
+    result = {
+        "sample_type": "off_topic",
+        "reference_coverage": round(_best_overlap(response, _reference_texts(sample)), 4),
+        "required_coverage": 0.0,
+        "trace_steps": trace_steps,
+        "missing_steps": [],
+        "evidence_count": len(evidence),
+        "grounding_status": grounding_status,
+        "response_is_fallback": app_module._is_fallback_content(response),
+        "schema_failures": schema_failures,
+        "trajectory_failures": [],
+    }
+    return (len(failures) == 0), failures, result
+
+
 def _grade_session(sample: dict[str, Any], response: str, evidence: list[dict[str, Any]], trace: dict[str, Any], grounding_status: str) -> tuple[bool, list[str], dict[str, Any]]:
     sample_type = str(sample.get("type", "default")).strip().lower()
+    if sample_type == "off_topic":
+        return _grade_off_topic(sample, response, evidence, trace, grounding_status)
     reference_texts = _reference_texts(sample)
     coverage = _best_overlap(response, reference_texts)
     trace_steps = _trajectory_from_steps(trace.get("steps", []))
@@ -466,8 +528,11 @@ def _patched_google_mode(mode: str):
 def _patched_eval_provider_preference():
     """Prefer local Ollama during eval so Groq outages do not confound results."""
     original_value = os.environ.get("GROQ_API_KEY")
+    original_provider = os.environ.get("LLM_PROVIDER")
     had_key = "GROQ_API_KEY" in os.environ
+    had_provider = "LLM_PROVIDER" in os.environ
     os.environ["GROQ_API_KEY"] = ""
+    os.environ["LLM_PROVIDER"] = "ollama"
     try:
         yield
     finally:
@@ -475,6 +540,10 @@ def _patched_eval_provider_preference():
             os.environ["GROQ_API_KEY"] = original_value or ""
         else:
             os.environ.pop("GROQ_API_KEY", None)
+        if had_provider:
+            os.environ["LLM_PROVIDER"] = original_provider or "auto"
+        else:
+            os.environ.pop("LLM_PROVIDER", None)
 
 
 @contextmanager
@@ -590,7 +659,7 @@ def _run_session(sample: dict[str, Any]) -> dict[str, Any]:
     record("retrieve", "ok", evidence_count=len(evidence))
 
     topic_terms = app_module._topic_terms(query, intent_data)
-    relevant_evidence = app_module._filter_relevant_evidence(evidence, topic_terms)
+    relevant_evidence = app_module._filter_relevant_evidence(evidence, topic_terms, intent_data)
     if evidence and topic_terms and not relevant_evidence:
         record("relevance_filter", "no_match")
         return {
@@ -607,6 +676,23 @@ def _run_session(sample: dict[str, Any]) -> dict[str, Any]:
         }
     if relevant_evidence:
         evidence = relevant_evidence
+    # Independent off-topic backstop — mirrors run_agent so the eval exercises the
+    # same gate production does. Catches planner/classifier drift the plan-derived
+    # relevance filter validates against itself.
+    if app_module._pack_is_off_topic(query, intent_data, evidence):
+        record("relevance_filter", "off_topic")
+        return {
+            "user_input": query,
+            "reference": sample["reference"],
+            "response": app_module._build_off_topic_pack_response(query, evidence),
+            "retrieved_contexts": [item.get("excerpt", "") for item in evidence if item.get("excerpt")],
+            "trace": trace,
+            "evidence": evidence,
+            "grounding_status": "blocked",
+            "provider": None,
+            "provider_used": None,
+            "fallback_reason": None,
+        }
     if app_module._is_current_fact_request(intent_data, temporal_context):
         evidence = app_module._filter_current_fact_evidence(evidence)
     record("relevance_filter", "ok", kept=len(evidence))

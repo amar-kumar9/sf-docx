@@ -1,0 +1,118 @@
+[
+  {
+    "id": "ldv_nightly",
+    "group": "architecture",
+    "question": "We process 500000 records every night. What Salesforce architecture should we use?",
+    "current_queries": [
+      "Salesforce Bulk API 2.0 large data volume",
+      "Batch Apex governor limits async processing",
+      "Salesforce LDV best practices"
+    ],
+    "boosted_queries": [
+      "Salesforce Bulk API 2.0 large data volume",
+      "Salesforce Well-Architected Framework Trusted Easy Adaptable",
+      "Salesforce Architecture Center integration patterns",
+      "Batch Apex governor limits async processing"
+    ]
+  },
+  {
+    "id": "flow_vs_apex",
+    "group": "architecture",
+    "question": "Can Flow replace an Apex trigger?",
+    "current_queries": [
+      "record-triggered flow vs Apex trigger",
+      "Flow limitations compared to Apex trigger"
+    ],
+    "boosted_queries": [
+      "record-triggered flow vs Apex trigger",
+      "Salesforce Well-Architected Framework Trusted Easy Adaptable",
+      "Salesforce Architecture Center decision guides",
+      "Flow limitations compared to Apex trigger"
+    ]
+  },
+  {
+    "id": "erp_integration",
+    "group": "architecture",
+    "question": "How should I integrate Salesforce with an external ERP?",
+    "current_queries": [
+      "Salesforce ERP integration",
+      "Salesforce REST SOAP outbound integration"
+    ],
+    "boosted_queries": [
+      "Salesforce ERP integration",
+      "Salesforce Well-Architected Framework Trusted Easy Adaptable",
+      "Salesforce Architecture Center integration patterns",
+      "Salesforce REST SOAP outbound integration"
+    ]
+  },
+  {
+    "id": "cdc_vs_platform_events",
+    "group": "architecture",
+    "question": "Should I use Platform Events or Change Data Capture for near-real-time sync?",
+    "current_queries": [
+      "Salesforce Platform Events vs Change Data Capture",
+      "Change Data Capture near real-time sync"
+    ],
+    "boosted_queries": [
+      "Salesforce Platform Events vs Change Data Capture",
+      "Salesforce Well-Architected Framework Trusted Easy Adaptable",
+      "Salesforce Architecture Center integration patterns",
+      "Change Data Capture near real-time sync"
+    ]
+  },
+  {
+    "id": "mcp_vs_api",
+    "group": "architecture",
+    "question": "How should I expose Salesforce data to a third-party AI agent, MCP or APIs?",
+    "current_queries": [
+      "Salesforce MCP vs REST API agent connectivity",
+      "Agentforce MCP server architecture"
+    ],
+    "boosted_queries": [
+      "Salesforce MCP vs REST API agent connectivity",
+      "Salesforce Well-Architected Framework Trusted Easy Adaptable",
+      "Salesforce Architecture Center integration patterns",
+      "Agentforce MCP server architecture"
+    ]
+  },
+  {
+    "id": "service_cloud_wa",
+    "group": "architecture",
+    "question": "What Well-Architected capabilities should a high-volume Service Cloud solution satisfy?",
+    "current_queries": [
+      "Service Cloud high volume architecture",
+      "Salesforce Service Cloud scalability"
+    ],
+    "boosted_queries": [
+      "Service Cloud high volume architecture",
+      "Salesforce Well-Architected Framework Trusted Easy Adaptable",
+      "Salesforce Architecture Center decision guides",
+      "Salesforce Service Cloud scalability"
+    ]
+  },
+  {
+    "id": "case_risk_indicator",
+    "group": "architecture",
+    "question": "I would like to implement Risk detection based on case details and subject line. Risk types: legal notice, social media highlight, knows CXO or board of directors, complaint related to an employee. Visual indicator for customer support rep.",
+    "current_queries": [
+      "Case risk detection subject line threat"
+    ],
+    "boosted_queries": [
+      "Einstein Case Classification Case Subject Description",
+      "Salesforce record-triggered Flow vs Apex Case",
+      "Salesforce Well-Architected Framework Trusted Easy Adaptable",
+      "Salesforce Architecture Center decision guides"
+    ]
+  },
+  {
+    "id": "control_platform_event",
+    "group": "control",
+    "question": "What is a Platform Event?",
+    "current_queries": [
+      "Salesforce Platform Events overview"
+    ],
+    "boosted_queries": [
+      "Salesforce Platform Events overview"
+    ]
+  }
+]
