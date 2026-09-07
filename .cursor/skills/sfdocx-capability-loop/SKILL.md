@@ -10,7 +10,7 @@ user-invocable: true
 
 # Salesforce capability loop
 
-You are the agent. Search live Salesforce docs with the Salesforce Docs MCP, then write the answer. Do not run Python. Do not read `.env`. Do not answer architecture from memory.
+You are the agent. Get the live official page. Do not wait for MCP. Do not answer architecture or current limits from memory or from a lagging atlas cheatsheet.
 
 ## Triggers
 
@@ -18,53 +18,56 @@ Use this skill when the user:
 - Designs or implements a Salesforce capability (classify, flag, show, notify, route)
 - Compares platform options (Flow vs Apex, CDC vs Platform Events, MCP vs API)
 - Asks Well-Architected, Architecture Center, or Decision Guides
-- Needs a current limit, API version, or what shipped this release
+- Needs a current limit, API version, heap size, or what shipped this release
 
 Do not use for org-specific Apex debugging, stack traces, or Agentforce org snapshots.
 
-## How to retrieve
+## Current facts (heap, governors, API version, what’s new)
 
-Use the **salesforce-docs** MCP (search / fetch tools; names vary, e.g. `salesforce_docs_search`). If that server is disconnected, say so and stop.
+These change every seasonal release. MCP search ranking `apex_gov_limits` / cheatsheet is **not** enough.
 
-On design questions, search capability layers — not the user's product guess. Budget 4. Do not stop until a kept URL is `architect.salesforce.com`:
+1. Open Help release notes in the **browser** (Help is a JS shell — curl/`WebFetch` returning “Loading” or “CSS Error” is a failed extract, not evidence):
 
-1. Capability queries (classification, Flow vs Apex, record UI, integration, LDV, …)
-2. `Salesforce Well-Architected Framework Trusted Easy Adaptable`
-3. Architecture Center decision guides, or integration patterns if the ask is integrate/sync/CDC/ERP/API
+`https://help.salesforce.com/s/articleView?id=release-notes.rn_<topic>.htm&release=<current>&type=5`
 
-Drop Shield / Event Monitoring / Security Center hits unless the user asked for org/session security. Seasonal facts: release notes, then the current guide labeled with this release.
+Heap example that MCP does not index: [rn_apex_heap_limit, Winter ’27](https://help.salesforce.com/s/articleView?id=release-notes.rn_apex_heap_limit.htm&release=264&type=5)
+
+2. If you do not know the article id, search Help for `Salesforce <topic> release notes` and open the `release-notes.rn_*` hit. Keep going until the article body contains the number.
+3. Salesforce Docs MCP is optional extra. If it only returns unversioned `atlas.en-us.apexcode` / cheatsheet, **discard it as the answer**. Quote the Help release-note body.
+4. Do not stop because MCP is disconnected. Browser the official URL.
+
+Winter ’27 heap (from that Help article): synchronous **6 MB → 10 MB**, asynchronous **12 MB → 25 MB**. Confirm on the page; do not reuse this paragraph if a later release note supersedes it.
+
+## Design questions
+
+Search capability layers, not the user’s product guess. Prefer Architecture Center. Budget 4. Do not stop until a kept URL is `architect.salesforce.com`. Drop Shield / Event Monitoring / Security Center unless the user asked for org/session security.
+
+Use Salesforce Docs MCP if it has hits. If not, browser `architect.salesforce.com` the same way.
 
 ## How to answer
 
-- Open with the capability (outcome), not a Salesforce SKU
-- If taxonomy, error-cost, or licensed-product choice is unknown → ADR-style **decision deferred**, not Einstein/Agentforce/Flow
-- Keep detection separate from business policy; an LLM is not the business rule
-- Cite source URLs. On design questions, Architecture Center must be cited or you must say it was missing
-- Label gaps `[Unverified]`. Use Trusted/Easy/Adaptable only if those words are in the evidence
-- If search returns nothing on-topic, refuse. Ask for the exact API or object. Do not invent URLs, limits, or versions
+- Current facts: cite the Help release-notes URL. Say if the standing Apex guide still shows the old number.
+- Design: open with the capability, not a SKU. Unanswered discovery → **decision deferred**.
+- Cite URLs. Label gaps `[Unverified]`.
+- Empty or off-topic evidence → refuse. Do not invent limits.
 
 ## Examples
 
-**User:** implement Case risk detection from subject/description, visual indicator for the support rep.
+**User:** Apex heap size as of 2026?
 
-Search Case Classification, record-triggered Flow vs Apex, Lightning record page — not Shield. If product choice is unknown, defer.
+Browser the Winter ’27 (and later) Help article `rn_apex_heap_limit`. Do not answer 6 MB / 12 MB from Execution Governors if that RN exists.
+
+**User:** Case risk from subject/description, visual indicator for the support rep.
+
+Search classification / Flow vs Apex / record UI — not Shield.
 
 **User:** Can Flow replace an Apex trigger?
 
-Cite Architecture Center. Do not stop on Help-only hits.
-
-**User:** What is the latest Salesforce API version?
-
-Release notes, then the current guide labeled with this release. Not training memory.
-
-**User:** How do I get Live Agent chat queue position?
-
-If the pack is Omni-Channel and not queue position, refuse. Ask for the exact API.
+Cite Architecture Center.
 
 ## Rules
 
-- Do not call `python cli.py` or `python cli.py retrieve`
-- Do not search the user's product guess; search the capability layer
-- Do not pick a SKU to sound complete
+- Do not call `python cli.py`
+- Do not treat MCP-miss as “the limit did not change”
+- Do not use third-party blogs as the number; they can corroborate after Help
 - CRM process language on Case/Account/Opportunity is not platform security
-- Fact lookups ("how do I get X") are not capability designs — search the named subject

@@ -8,7 +8,7 @@ Grounds Salesforce design answers in **live official docs**. In Cursor, the mode
 2. Enable the **salesforce-docs** MCP if Cursor prompts (project file: `.cursor/mcp.json`).
 3. Ask a design question.
 
-The skill `.cursor/skills/sfdocx-capability-loop/SKILL.md` tells the agent to search capability-first, keep going until Architecture Center hits, and refuse when docs do not support a product. Copying `SKILL.md` alone still needs that MCP in Cursor (project or user `mcp.json`).
+The skill `.cursor/skills/sfdocx-capability-loop/SKILL.md` tells the agent to search capability-first, keep going until Architecture Center hits, and refuse when docs do not support a product. For heap, API version, and other seasonal facts it **must open Help release notes in the browser** — Salesforce Docs MCP often still has last season’s `apex_gov_limits` page and will miss `release-notes.rn_*` articles.
 
 ## Optional: Python CLI / Gradio
 
