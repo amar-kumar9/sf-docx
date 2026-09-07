@@ -4,11 +4,24 @@ A local AI agent that answers Salesforce questions by retrieving and grounding a
 
 The **Python agent always owns retrieval, Architecture Center routing, and grounding**. Synthesis uses whatever LLM is on *this* machine. If none is configured, Python still returns the retrieved docs (retrieval-only), and Cursor can synthesize from that pack.
 
+Search does not live in the skill. Python posts JSON-RPC to `MCP_URL` (Salesforce docs MCP, tool `salesforce_docs_search`). Copy `.env.example` to `.env`. No LLM key is required for retrieve.
+
+## Cursor skill
+
+Open this repo in Cursor. The agent loads `.cursor/skills/sfdocx-capability-loop/SKILL.md` and runs `python cli.py retrieve --json` before it writes an answer. Copying only `SKILL.md` is not enough — retrieve needs this directory, Python, and `MCP_URL`.
+
+```bash
+cp .env.example .env
+python cli.py retrieve --json "Can Flow replace an Apex trigger?"
+```
+
+If `evidence` is empty, the MCP server is unreachable.
+
 ## Two ways to run it
 
 | Where you are | Who writes the answer | What you run |
 |---|---|---|
-| Cursor on a new laptop (no Groq/Ollama key) | Cursor (local agent) | Ask in chat. The project skill runs `python cli.py retrieve --json`. |
+| Cursor on a new laptop (no Groq/Ollama key) | Cursor (local agent) | Ask in chat. The `sfdocx-capability-loop` skill runs `python cli.py retrieve --json`. |
 | Gradio / CLI with a key or Ollama | Python agent | `python cli.py ui` or `python cli.py ask "..."` |
 
 `python cli.py status` shows what this machine can use.
@@ -17,7 +30,7 @@ The **Python agent always owns retrieval, Architecture Center routing, and groun
 
 Copy `.env.example` to `.env`, or use the Gradio sidebar. Keys stay in `.env` (gitignored).
 
-1. **Cursor** — no key. The skill in `.cursor/skills/sfdc-docs-agent/` retrieves via Python, then the local agent writes the answer.
+1. **Cursor** — no key. The skill in `.cursor/skills/sfdocx-capability-loop/` retrieves via Python, then the local agent writes the answer.
 2. **Ollama** — install [Ollama](https://ollama.com), pull a model, leave `LLM_PROVIDER=auto`.
 3. **LM Studio** — start the local server (`http://127.0.0.1:1234/v1`).
 4. **Cloud key** — set any one of `GROQ_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`.
@@ -59,7 +72,7 @@ python scripts/diagnose_retrieval.py
 - `eval/` — eval harness, MCP fixtures, architecture probes
 - `scripts/` — retrieval diagnostics
 - `tests/` — pipeline tests
-- `.cursor/skills/sfdc-docs-agent/` — Cursor skill (host agent + Python retrieval)
+- `.cursor/skills/sfdocx-capability-loop/` — Cursor skill (calls `python cli.py retrieve`)
 
 ## Notes
 
