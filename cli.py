@@ -45,7 +45,7 @@ def cmd_status() -> int:
     if not status["active"]:
         print("No LLM is configured. The Python agent still retrieves Salesforce docs.")
         print("Pick one:")
-        print("  1. Ask in Cursor — sfdocx-capability-loop calls `python cli.py retrieve`")
+        print("  1. Ask in Cursor — sfdocx-capability-loop uses Salesforce Docs MCP (no .env)")
         print("  2. Start Ollama or LM Studio, then re-run this command")
         print("  3. python cli.py ui  and paste a Groq / OpenAI / Anthropic / Gemini key")
         print("  4. Copy .env.example to .env and set a key")

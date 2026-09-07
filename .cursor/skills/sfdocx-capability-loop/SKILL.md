@@ -10,7 +10,7 @@ user-invocable: true
 
 # Salesforce capability loop
 
-Name the business capability before any product. Retrieve live Salesforce docs. Do not answer architecture from memory.
+You are the agent. Search live Salesforce docs with the Salesforce Docs MCP, then write the answer. Do not run Python. Do not read `.env`. Do not answer architecture from memory.
 
 ## Triggers
 
@@ -24,25 +24,24 @@ Do not use for org-specific Apex debugging, stack traces, or Agentforce org snap
 
 ## How to retrieve
 
-From the workspace root (try `python3` if `python` is missing):
+Use the **salesforce-docs** MCP (search / fetch tools; names vary, e.g. `salesforce_docs_search`). If that server is disconnected, say so and stop.
 
-```bash
-python cli.py retrieve --json "<user question>"
-```
+On design questions, search capability layers — not the user's product guess. Budget 4. Do not stop until a kept URL is `architect.salesforce.com`:
 
-Parse `evidence[].excerpt`, `evidence[].url`, `solution_plan`, and `host_instructions`. Follow `host_instructions`. You write the answer — do not call `python cli.py ask` unless they asked the Python model to write.
+1. Capability queries (classification, Flow vs Apex, record UI, integration, LDV, …)
+2. `Salesforce Well-Architected Framework Trusted Easy Adaptable`
+3. Architecture Center decision guides, or integration patterns if the ask is integrate/sync/CDC/ERP/API
 
-Empty `evidence` means `MCP_URL` is down. Refuse. Do not invent URLs, limits, or API versions.
-
-On design questions the pack must include `architect.salesforce.com` or you must say it is missing. If `avoid_platform_security` is true, do not recommend Shield, Event Monitoring, or Security Center.
+Drop Shield / Event Monitoring / Security Center hits unless the user asked for org/session security. Seasonal facts: release notes, then the current guide labeled with this release.
 
 ## How to answer
 
 - Open with the capability (outcome), not a Salesforce SKU
-- Unanswered `discovery_questions` → ADR-style **decision deferred**, not Einstein/Agentforce/Flow
-- `separate_detection_from_policy` → an LLM is not the business rule
-- Seasonal facts: release notes over current guide over cheatsheets. If only a digest is in the pack, say it may lag
-- Cite source URLs. Label gaps `[Unverified]`. Use Trusted/Easy/Adaptable only if those words are in the evidence
+- If taxonomy, error-cost, or licensed-product choice is unknown → ADR-style **decision deferred**, not Einstein/Agentforce/Flow
+- Keep detection separate from business policy; an LLM is not the business rule
+- Cite source URLs. On design questions, Architecture Center must be cited or you must say it was missing
+- Label gaps `[Unverified]`. Use Trusted/Easy/Adaptable only if those words are in the evidence
+- If search returns nothing on-topic, refuse. Ask for the exact API or object. Do not invent URLs, limits, or versions
 
 ## Examples
 
@@ -64,8 +63,8 @@ If the pack is Omni-Channel and not queue position, refuse. Ask for the exact AP
 
 ## Rules
 
-- Do not skip retrieve because this machine has no Groq/Ollama key
+- Do not call `python cli.py` or `python cli.py retrieve`
 - Do not search the user's product guess; search the capability layer
 - Do not pick a SKU to sound complete
 - CRM process language on Case/Account/Opportunity is not platform security
-- Fact lookups ("how do I get X") are not capability designs — retrieve the named subject
+- Fact lookups ("how do I get X") are not capability designs — search the named subject
