@@ -1,7 +1,0 @@
-{
-  "mcpServers": {
-    "salesforce-docs": {
-      "url": "https://api.salesforce.com/sse"
-    }
-  }
-}

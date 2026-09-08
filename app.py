@@ -14,6 +14,7 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
 from providers import get_llm
+import claim_risk
 from prompts import (
     INTENT_CLASSIFIER_PROMPT,
     QUERY_PLANNER_PROMPT,
@@ -115,8 +116,8 @@ def _charge_cost(thread_id: str, tokens: int, provider: str) -> float:
 def _session_cost(thread_id: str) -> float:
     return _SESSION_COST.get(thread_id, 0.0)
 
-# Facts that change release-to-release — LLM classifier must NOT override these.
-# The static docs are always stale for these; release notes must be consulted.
+# Legacy topic patterns — kept as a thin alias so older search-boost paths and
+# tests still recognize classic limit wording. Prefer claim_risk for gating.
 _VOLATILE_LIMIT_PATTERNS = re.compile(
     r"\b(heap\s*size|governor\s*limit|platform\s*limit|apex\s*limit|soql\s*limit|"
     r"dml\s*limit|cpu\s*limit|callout\s*limit|api\s*version|api\s*limit|"
@@ -126,7 +127,13 @@ _VOLATILE_LIMIT_PATTERNS = re.compile(
 
 
 def _is_volatile_limit_question(message: str) -> bool:
-    """Returns True if the question asks about a Salesforce limit that changes per release."""
+    """True when the question asserts a mutable Salesforce platform claim shape.
+
+    Uses claim-risk heuristics (limits, quotas, versions, availability) rather
+    than only a hard-coded topic list. Legacy pattern match remains as fallback.
+    """
+    if claim_risk.question_suggests_mutable_platform_fact(message):
+        return True
     return bool(_VOLATILE_LIMIT_PATTERNS.search(message))
 
 
@@ -532,6 +539,8 @@ def _needs_seasonal_authority(
     if temporal.get("historical_release_requested") or temporal.get("current_docs_required"):
         return True
     if _is_volatile_limit_question(message):
+        return True
+    if claim_risk.question_suggests_mutable_platform_fact(message):
         return True
     intent = str((intent_data or {}).get("intent") or "")
     return intent in {"limits", "release"}
@@ -2996,7 +3005,16 @@ def build_evidence_pack(message: str, llm=None) -> dict:
         )
     else:
         host = _host_instructions_for_plan(plan)
-    if not off_topic and _needs_seasonal_authority(message, intent_data, temporal_context):
+    claim_analysis = claim_risk.analyze_evidence_claims(
+        message,
+        evidence,
+        is_release_notes=_is_release_notes_evidence,
+    )
+    verification = claim_risk.verification_from_claim_risk(claim_analysis)
+    if not off_topic and (
+        _needs_seasonal_authority(message, intent_data, temporal_context)
+        or claim_analysis.get("requires_current_release")
+    ):
         host += (
             " Seasonal facts: Salesforce ships three releases a year. Release notes "
             "are the court order. The current developer guide is the statute. "
@@ -3005,6 +3023,8 @@ def build_evidence_pack(message: str, llm=None) -> dict:
             "If the pack has a digest without release notes, do not treat the digest "
             "value as current — state the lag and point at the notes."
         )
+    if not off_topic:
+        host += claim_risk.host_instructions_for_claim_risk(claim_analysis, verification)
     return {
         "question": message,
         "blocked": False,
@@ -3012,6 +3032,16 @@ def build_evidence_pack(message: str, llm=None) -> dict:
         "temporal": temporal_context,
         "solution_plan": _public_solution_plan(plan),
         "evidence": evidence,
+        "claims": claim_analysis.get("claims") or [],
+        "claim_risk": {
+            "requires_current_release": bool(claim_analysis.get("requires_current_release")),
+            "has_release_notes_evidence": bool(
+                claim_analysis.get("has_release_notes_evidence")
+            ),
+            "volatile_claim_count": len(claim_analysis.get("volatile_claims") or []),
+            "volatile_claims": claim_analysis.get("volatile_claims") or [],
+        },
+        "verification": verification,
         "relevance": "off_topic" if off_topic else "on_topic",
         "mode": "full" if llm is not None else "retrieval_only",
         "host_instructions": host,
